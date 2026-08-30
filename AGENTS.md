@@ -1,0 +1,296 @@
+# AGENTS.md
+
+Guía de onboarding para agentes que trabajen en este repo. Leer completo antes
+de tocar código: hay varios hallazgos no obvios sobre el sitio que, si se
+ignoran, producen un dataset silenciosamente corrupto.
+
+## Qué es esto
+
+Scraper de [fragrantica.com](https://www.fragrantica.com) que construye un
+dataset de tres dimensiones para entrenar un **sistema de recomendación**
+(trabajo de maestría).
+
+| Catálogo | Contenido |
+|---|---|
+| `items` | Perfumes: notas, accords, familia olfativa, rating agregado, perfumistas |
+| `users` | Miembros que escribieron al menos una review |
+| `interactions` | Reviews, votos y wardrobe: `(member_id, perfume_id, rating 1-5, contexto, texto, timestamp, source)` |
+
+Escala del sitio, según sus propios contadores: **137.633 perfumes, 2,6M
+reviews, 2,0M miembros**.
+
+Documentos hermanos: [`PLAN.md`](PLAN.md) tiene el análisis del sitio y las
+decisiones de diseño con su justificación. [`README.md`](README.md) tiene el uso
+operativo. **Este archivo no los duplica**; se centra en estado y contexto.
+
+## Estado actual (última actualización: daemon continuo, jitter 10–20 s)
+
+Se implementó el pipeline completo y un **vertical slice sobre Dior**. El
+crawl one-shot se cortaba en el primer interstitial; ahora el comando
+`fragrantica daemon` sigue solo (espera + un probe + reanuda).
+
+### Implementación: completa
+
+- Las 6 fases, el frontier reanudable, el cliente HTTP con impersonación TLS,
+  los 3 parsers, la consolidación con k-core, el CLI y el **daemon**.
+- Tests en verde (incluye consolidación, crypto AES, parser de shelves, watchdog).
+- `.gitignore` creado: `data/`, `.venv/`, caches. El mapeo privado no se versiona.
+
+### Datos recolectados hasta ahora
+
+```
+frontier:  designer  1 done
+           perfume   268 done | 88 pending | 2 skipped
+           profile   ~13.7k pending      <-- fase 3 nunca corrió
+           member_ids: 0                 <-- consecuencia de lo anterior
+```
+
+Los pending de perfume son URLs que cayeron por 429/403/interstitial y
+volvieron a la cola. El daemon las retoma cuando el probe da 200.
+
+### Qué falta
+
+1. Dejar corriendo `fragrantica daemon` (fase 2 → fase 3, sin apagarse).
+2. Cuando las colas estén vacías: fases 5 y 6; revisar `dataset_card.md`.
+3. Validar que el dataset entrena un ALS/LightFM.
+4. Recién entonces el catálogo completo: **una IP hogareña no alcanza**
+   (~2M perfiles). Ahí hace falta `FRAGRANTICA_PROXY` residencial.
+
+## Bloqueador: Cloudflare por IP, no un bug del código
+
+| Configuración | Resultado medido |
+|---|---|
+| 6 workers, jitter 0.4–2.0s (~5 req/s) | HTTP 429 sostenido tras ~150 requests |
+| 1 worker, jitter 5–12 s | interstitial tras un puñado de requests en IP recién rotada |
+| 1 worker, jitter 20–40 s + daemon | ~88 páginas OK en 45 min; interstitial en Dioressence |
+| 1 worker, jitter 10–20 s + daemon | default actual (no subir concurrency) |
+
+Un burst corto **no** detecta el 429. Seguir pidiendo después de un interstitial
+es lo que escala a 403 de IP. El daemon **no** martillea: espera 30 min / 1 h /
+2 h (tope 6 h), hace **un** probe, y solo entonces reanuda.
+
+```bash
+.venv/bin/fragrantica daemon    # el proceso que hay que dejar vivo
+.venv/bin/fragrantica status
+pgrep -fl fragrantica           # un solo proceso
+```
+
+Comandos de higiene del frontier:
+
+```bash
+.venv/bin/fragrantica reset-429   # pending+attempts=0 para 429/403/interstitial
+.venv/bin/fragrantica retry-dead  # dead-letters genéricos
+.venv/bin/fragrantica status
+```
+
+## Conocimiento del dominio que hay que tener
+
+Cinco hallazgos verificados empíricamente. Los dos primeros son los que arruinan
+el dataset si se ignoran.
+
+### 1. El sitio usa `0` para "no votó", no como valor
+
+Es el más peligroso. El blob de votos de cada review se ve así:
+
+```json
+{"rating":4,"winter":1,"longevity":3,"sillage":2,"gender":null,"relation":"had"}
+```
+
+Pero en la página de Sauvage, 51 de 210 reviews traen `rating:0` **y además**
+`longevity:0`, `sillage:0` y todas las estaciones en 0: son usuarios que
+escribieron texto sin votar nada.
+
+Si un `rating=0` se colara al dataset, el recomendador lo leería como la **peor
+calificación posible** en vez de como dato ausente, sesgando a la baja todas las
+medias de item y de usuario e inventando señal negativa que nunca existió.
+
+La normalización vive en `parsers/votes.py` y la semántica **no es uniforme**:
+
+- `rating`, `longevity`, `sillage` → escalas 1-5, el 0 es ausencia → `None`
+- estaciones, `day`, `night` → flags binarios, el 0 **sí** significa "no lo
+  eligió"... pero solo si el usuario votó algo; si no votó nada, también `None`
+
+El validador de `models.py` rechaza `rating=0` como red de seguridad.
+
+### 2. Las páginas de perfume no traen el `member_id`
+
+Solo el username y el slug `/@usuario`. El `member_id` numérico aparece
+**únicamente** en la página de perfil (`:member-id="3158387"`).
+
+Por eso el flujo es: fase 2 escribe interacciones con `username_slug` y
+`member_id = NULL` → fase 3 crawlea perfiles → fase 4 hace el backfill de la FK.
+Y por eso la fase 3 es obligatoria y no opcional.
+
+Se usa `member_id` como clave canónica (no el slug) porque el slug cambia si el
+usuario se renombra.
+
+Hay un atajo parcial: los avatares tipo `avatari/m.3146574.jpg` codifican el
+`member_id` (verificado en 2 perfiles), pero **no es universal** — los avatares
+custom usan otro almacén. Se usa solo como chequeo cruzado del parser.
+
+### 3. Cloudflare filtra por fingerprint TLS, no con JS challenge
+
+`curl` normal → 403 "Just a moment" en toda página interior. `curl_cffi` con
+`impersonate="chrome"` → 200 con contenido completo. **No hace falta navegador**
+en el camino normal, y meterlo sería 20-50× más lento sin aportar nada.
+
+Trampa: el script `challenge-platform` de Cloudflare está embebido en **todas**
+las páginas, incluso las buenas. Buscarlo da falsos positivos. La detección
+correcta está en `http_client.looks_like_challenge()` y hay un test que la
+protege.
+
+### 4. Las reviews vienen server-rendered, pero truncadas a ~200
+
+No se cargan por AJAX: están en el HTML inicial. Excelente, porque un request de
+perfume rinde item + ~200 interacciones + ~200 semillas de usuario.
+
+Pero el archivo completo requiere login (el bundle dice `"Sign in to access the
+full review archive"`). Con un promedio de ~19 reviews por perfume, para la
+mayoría de items las 200 alcanzan; los populares quedan truncados y se marcan
+con `reviews_truncated`. La cola se cubre vía fase 3.
+
+### 5. Wardrobe y votos sin review: ajax cifrado, ahora en alcance
+
+En Fragrantica puntuar y reseñar son acciones separadas. Sauvage tiene **33.917
+votos** contra **~4.200 reviews**: ~8 votos por review.
+
+Esas puntuaciones individuales y los items del wardrobe viven en
+`POST /ajax.php?user_shelves`, que `robots.txt` prohíbe (`Disallow: /ajax`).
+**Decisión del usuario: perseguirlos.** El payload viene cifrado CryptoJS
+`{ct,iv,s}` (AES-256-CBC, EvpKDF-MD5). El passphrase no está en el HTML
+(`toAbby` y el resto de secretos inline no abren los blobs del fixture de
+@quilter). Se recupera del bundle `/new-js/mfga2-app.js` probando string
+literals contra un blob canario de la misma página (`favorite_shelf`), sin
+ejecutar JS ni poner un navegador en el camino caliente.
+
+La fase 3 hace un POST extra por perfil. Si el bundle no se puede bajar o el
+descifrado falla, el perfil se guarda igual con las reviews del HTML. Un 403
+en el ajax corta los POST del resto del proceso para no gastar 13k requests
+inútiles.
+
+El dedup de la fase 6 es por `(member_id, perfume_id)`, no por `review_id`:
+los votos/wardrobe tienen `review_id` nulo y un PARTITION BY review_id los
+colapsaría a una sola fila. Preferencia: review > voto > wardrobe.
+
+## Arquitectura
+
+```
+src/fragrantica/
+├── config.py            CrawlConfig (red, cortesía) y DatasetConfig (umbrales)
+├── models.py            Item / User / Interaction (Pydantic v2, valida esquema)
+├── http_client.py       curl_cffi + rotación de perfiles, jitter, circuit breaker
+├── frontier.py          máquina de estados del crawl en SQLite  <-- pieza clave
+├── storage.py           writers Parquet atómicos (.tmp + rename)
+├── parsers/
+│   ├── designer.py      fase 1: enumeración de IDs
+│   ├── perfume.py       fase 2: item + interacciones + semillas
+│   ├── profile.py       fase 3: usuario + histórico completo + member_id
+│   ├── votes.py         normalización del blob de votos  <-- leer el punto 1
+│   ├── crypto.py        AES CryptoJS + passphrase del bundle
+│   └── shelves.py       wardrobe / votos sin review (JSON ya descifrado)
+├── pipeline/
+│   ├── runner.py        motor genérico: concurrencia + estados + orden de commits
+│   ├── daemon.py        watchdog: espera + probe + reanuda (fase 2 → 3)
+│   ├── phases.py        fases 1, 2, 3, 5 (con red)
+│   └── consolidate.py   fases 4 y 6 (locales): dedup, k-core, export
+└── cli.py               typer: slice / phase / daemon / status / retry-dead
+```
+
+### Reanudabilidad: cómo funciona
+
+Todo el estado vive en `data/frontier.db`, commiteado transaccionalmente.
+
+```
+pending --claim--> in_progress --ok--------> done
+                        |
+                        +--error transitoria--> failed --backoff--> pending
+                        |                          |
+                        |                    (attempts >= 6)
+                        |                          v
+                        |                        dead
+                        +--404 / sin reviews-----> skipped
+                        +--interstitial + canario OK -> deferred
+```
+
+Cuatro invariantes que **no hay que romper** al modificar el runner:
+
+1. **El flush de datos ocurre ANTES del `mark_done`.** Si el proceso muere
+   entremedio, la URL sigue `in_progress`, el lease vence y se reprocesa. Se
+   prefiere trabajo duplicado (que el dedup de la fase 6 absorbe) sobre datos
+   perdidos.
+2. **Los leases vencen.** `reclaim_stale()` devuelve a `pending` lo que quedó
+   `in_progress` hace más de 15 min. Es lo que hace segura la recuperación de un
+   `kill -9`.
+3. **El 429 corta el ciclo** (`requeue` + StopCrawl). Un interstitial hace
+   un canario (Sauvage, misma sesión): si pasa, la URL va a `deferred` (12 h)
+   y el lote sigue; si el canario también falla, StopCrawl como el 429.
+4. **La condición de salida mira `waiting_count()`, no solo `pending_count()`.**
+   `pending_count` solo cuenta lo elegible *ya*; sin `waiting_count` el runner
+   abandonaría los items diferidos por backoff. (Este bug existió y está
+   cubierto por un test.)
+
+## Cómo correr
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+export FRAGRANTICA_SALT="algo-secreto-y-estable"
+
+.venv/bin/python -m pytest tests/ -q        # tests, ~1s, sin red
+.venv/bin/fragrantica status
+.venv/bin/fragrantica daemon                # fase 2 y 3, continuo
+```
+
+Los tests **no tocan la red**: corren contra HTML congelado en
+`tests/fixtures/` (5,2MB, 4 fixtures). Correrlos siempre antes de commitear; son
+la defensa contra un cambio de markup del sitio.
+
+Para trabajo iterativo sobre parsers hay un script de salida legible:
+
+```bash
+.venv/bin/python tests/check_parsers.py
+```
+
+## Issues conocidos
+
+1. **`data/staging/item_frontier/` tiene datos viejos.** Sus 358 filas se
+   generaron antes de arreglar la contaminación de marcas (ver abajo) e incluyen
+   39 perfumes que no son de Dior. No corrompe el dataset final (los items se
+   reparsean de su propia página y el frontier dedupea por URL), pero la
+   atribución de marca en esa tabla auxiliar es incorrecta. Para limpiarlo:
+   borrar el directorio y recorrer la fase 1.
+
+   El bug era que el listado de marca linkea perfumes ajenos desde widgets
+   laterales ("currently wearing", relacionados). Arreglado acotando la
+   selección a `a.prefumeHbox`; hay un test que lo cubre.
+
+2. **`.gitignore` ya está.** Cubre `.venv/`, `data/` y caches. No commitear
+   `data/final/PRIVATE_user_mapping.parquet` si alguien relaja el ignore.
+
+3. **No subir `concurrency`.** El 429 fue ritmo agregado. Acelerar = bajar
+   `delay_min`/`delay_max` (ahora 10–20 s). Si vuelve el interstitial, el
+   daemon espera; no compensar con más workers.
+
+4. **`reviews_total` es aproximado** en items populares: el sitio lo muestra
+   abreviado ("4.2K"). La columna `reviews_total_is_approx` lo marca. No usarlo
+   para aritmética exacta.
+
+## Próximos pasos, en orden
+
+1. `fragrantica daemon` hasta vaciar perfume y profile.
+2. Fases 5 y 6; revisar el `dataset_card.md` generado.
+3. Validar que el dataset entrena un ALS/LightFM sin problemas de integridad.
+4. Recién entonces evaluar escalar al catálogo completo, con proxy residencial
+   (las estimaciones de `PLAN.md` a ~6 req/s quedaron desactualizadas).
+
+## Convenciones
+
+- **Comentarios, docstrings y documentación en español.** Los identificadores en
+  inglés. Mantener esa mezcla, es la convención del repo.
+- Los comentarios explican **por qué**, no qué hace el código. Varios documentan
+  hallazgos empíricos sobre el sitio; no borrarlos, son la memoria del proyecto.
+- Al descubrir algo nuevo sobre el sitio: agregar un test con fixture y
+  documentarlo acá o en `PLAN.md`.
+- Nunca subir la concurrencia sin medir. El sitio ya demostró que responde 429.
+- Los endpoints `/ajax` están en alcance por decisión explícita del usuario
+  (`CrawlConfig.fetch_shelves`). No reabrir esa discusión: si hay que
+  apagarlos, `fetch_shelves=False`.

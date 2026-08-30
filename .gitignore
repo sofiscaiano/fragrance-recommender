@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.DS_Store
+
+# El crawl entero: frontier, staging y el dataset. En particular
+# data/final/PRIVATE_user_mapping.parquet es el mapeo reversible
+# hash -> username y no debe versionarse.
+data/
