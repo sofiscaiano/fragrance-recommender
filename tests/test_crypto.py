@@ -10,6 +10,7 @@ from fragrantica.parsers.crypto import (
     decrypt_cryptojs,
     encrypt_cryptojs,
     encrypted_blobs_from_html,
+    passphrase_from_host,
     recover_passphrase,
     unwrap_ajax_body,
 )
@@ -43,6 +44,19 @@ def test_toabby_is_not_the_aes_passphrase():
         decrypt_cryptojs(blobs["favorite_shelf"], hexpart)
     with pytest.raises(DecryptError):
         decrypt_cryptojs(blobs["favorite_shelf"], raw)
+
+
+def test_host_passphrase_opens_quilter_member_home():
+    """Hallazgo de Bruno: _pd(www.fragrantica.com) abre los blobs reales."""
+    import orjson
+
+    html = (FX / "profile_quilter.html").read_text()
+    blobs = encrypted_blobs_from_html(html)
+    pw = passphrase_from_host("www.fragrantica.com")
+    data = orjson.loads(decrypt_cryptojs(blobs["memberHomeData"], pw))
+    assert data["user_id"] == 3158387
+    with pytest.raises(DecryptError):
+        decrypt_cryptojs(blobs["memberHomeData"], passphrase_from_host("fragrantica.com"))
 
 
 def test_recover_passphrase_from_literals_near_pd():

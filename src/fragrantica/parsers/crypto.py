@@ -6,10 +6,9 @@ los abre con AES-256-CBC, clave e IV derivados del passphrase via EvpKDF-MD5
 (1 iteracion, salt de 8 bytes). El `iv` del JSON es redundante: se rederiva
 del passphrase + salt, igual que CryptoJS.AES.decrypt(json, passphrase).
 
-El passphrase no esta en el HTML (se probo `toAbby` y el resto de secretos
-inline contra los blobs del fixture de @quilter: PKCS7 no cierra). Vive en
-el bundle `/new-js/mfga2-app.js`. Se recupera probando los string literals del
-bundle contra un blob de la misma pagina, sin ejecutar JS.
+El passphrase no esta en el HTML (`toAbby` no abre los blobs). Es
+`window._pd(host)`: se deriva del hostname (`www.fragrantica.com` incluye
+el `www.`). Portado de mfga-fes.js; no hace falta bajar el bundle JS.
 """
 
 from __future__ import annotations
@@ -20,10 +19,13 @@ import json
 import os
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 import orjson
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
+
+from ..config import BASE_URL
 
 _CT_OBJ = re.compile(
     r'\{\s*"ct"\s*:\s*"(?P<ct>[^"]+)"\s*,\s*"iv"\s*:\s*"(?P<iv>[^"]+)"\s*,\s*"s"\s*:\s*"(?P<s>[^"]+)"\s*\}'
@@ -39,6 +41,21 @@ _BUNDLE_SRC = re.compile(r'src="(/new-js/mfga2-app\.js[^"]*)"')
 
 class DecryptError(ValueError):
     """El blob no se pudo abrir con ese passphrase."""
+
+
+def passphrase_from_host(host: str | None = None) -> str:
+    """Replica `window._pd()` de mfga-fes.js: el secreto es el hostname.
+
+    Tiene que ser exactamente `www.fragrantica.com`. Sin `www.` no abre.
+    """
+    if host is None:
+        host = urlparse(BASE_URL).hostname or "www.fragrantica.com"
+    rev = host[::-1]
+    inter = "".join(host[i] + rev[i] for i in range(len(host)))
+    xored = "".join(chr(ord(inter[i]) ^ ((7 * i + 13) & 127)) for i in range(len(inter)))
+    o = hashlib.md5(xored.encode("utf-8")).hexdigest()
+    s = hashlib.md5((host + o[:8]).encode("utf-8")).hexdigest()
+    return hashlib.md5((o + s).encode("utf-8")).hexdigest()
 
 
 def evp_bytes_to_key(

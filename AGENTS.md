@@ -14,7 +14,8 @@ dataset de tres dimensiones para entrenar un **sistema de recomendación**
 |---|---|
 | `items` | Perfumes: notas, accords, familia olfativa, rating agregado, perfumistas |
 | `users` | Miembros que escribieron al menos una review |
-| `interactions` | Reviews, votos y wardrobe: `(member_id, perfume_id, rating 1-5, contexto, texto, timestamp, source)` |
+| `interactions` | Reviews y votos (calificación explícita): `(member_id, perfume_id, rating 1-5, texto, timestamp, source)` |
+| `wardrobe` | Colección have/had/want. **Tabla aparte**: no es un rating y no entra al k-core |
 
 Escala del sitio, según sus propios contadores: **137.633 perfumes, 2,6M
 reviews, 2,0M miembros**.
@@ -78,8 +79,9 @@ pgrep -fl fragrantica           # un solo proceso
 Comandos de higiene del frontier:
 
 ```bash
-.venv/bin/fragrantica reset-429   # pending+attempts=0 para 429/403/interstitial
-.venv/bin/fragrantica retry-dead  # dead-letters genéricos
+.venv/bin/fragrantica reset-429          # pending+attempts=0 para 429/403/interstitial
+.venv/bin/fragrantica retry-dead         # dead-letters genéricos
+.venv/bin/fragrantica requeue-profiles   # perfiles already-done → pending (2º pase wardrobe)
 .venv/bin/fragrantica status
 ```
 
@@ -158,19 +160,19 @@ Esas puntuaciones individuales y los items del wardrobe viven en
 `POST /ajax.php?user_shelves`, que `robots.txt` prohíbe (`Disallow: /ajax`).
 **Decisión del usuario: perseguirlos.** El payload viene cifrado CryptoJS
 `{ct,iv,s}` (AES-256-CBC, EvpKDF-MD5). El passphrase no está en el HTML
-(`toAbby` y el resto de secretos inline no abren los blobs del fixture de
-@quilter). Se recupera del bundle `/new-js/mfga2-app.js` probando string
-literals contra un blob canario de la misma página (`favorite_shelf`), sin
-ejecutar JS ni poner un navegador en el camino caliente.
+(`toAbby` no abre los blobs). Es `window._pd(hostname)`: se deriva de
+`www.fragrantica.com` (el `www.` importa). No hace falta bajar el bundle JS.
 
-La fase 3 hace un POST extra por perfil. Si el bundle no se puede bajar o el
-descifrado falla, el perfil se guarda igual con las reviews del HTML. Un 403
-en el ajax corta los POST del resto del proceso para no gastar 13k requests
-inútiles.
+La fase 3 hace un POST extra por perfil. Si el descifrado falla, el perfil se
+guarda igual con las reviews del HTML. Un 403 en el ajax corta los POST del
+resto del proceso para no gastar 13k requests inútiles.
 
-El dedup de la fase 6 es por `(member_id, perfume_id)`, no por `review_id`:
-los votos/wardrobe tienen `review_id` nulo y un PARTITION BY review_id los
-colapsaría a una sola fila. Preferencia: review > voto > wardrobe.
+Los **votos** entran a `interactions` con `source=vote` y `review_id` nulo
+(sí son una calificación). El **wardrobe** va a `staging/wardrobe/` y al
+export `wardrobe.parquet`: have/had/want no se mezcla con las reviews ni
+pasa por el k-core. El dedup de interacciones es por `(member_id, perfume_id)`
+y prefiere review sobre voto. Un PARTITION BY `review_id` colapsaría todos
+los votos nulos a una sola fila.
 
 ## Arquitectura
 
@@ -186,8 +188,8 @@ src/fragrantica/
 │   ├── perfume.py       fase 2: item + interacciones + semillas
 │   ├── profile.py       fase 3: usuario + histórico completo + member_id
 │   ├── votes.py         normalización del blob de votos  <-- leer el punto 1
-│   ├── crypto.py        AES CryptoJS + passphrase del bundle
-│   └── shelves.py       wardrobe / votos sin review (JSON ya descifrado)
+│   ├── crypto.py        AES CryptoJS + passphrase = _pd(host)
+│   └── shelves.py       votos -> Interaction; wardrobe -> WardrobeItem
 ├── pipeline/
 │   ├── runner.py        motor genérico: concurrencia + estados + orden de commits
 │   ├── daemon.py        watchdog: espera + probe + reanuda (fase 2 → 3)

@@ -215,6 +215,27 @@ def status(data_dir: Path = typer.Option(DATA_DIR)) -> None:
     frontier.close()
 
 
+@app.command("requeue-profiles")
+def requeue_profiles(
+    data_dir: Path = typer.Option(DATA_DIR),
+) -> None:
+    """Devuelve a pending los perfiles ya crawleados (reviews) para un 2º pase.
+
+    No borra staging: las reviews duplicadas las absorbe el dedup. Baja la
+    prioridad para que los perfiles nunca visitados salgan primero. Pensado
+    para cuando falle el wardrobe (passphrase) y haya que volver por esos
+    member_id sin tirar el trabajo de reviews.
+    """
+    _, _, db = _paths(data_dir)
+    frontier = Frontier(db)
+    n = frontier.requeue_done_profiles()
+    console.print(
+        f"{n} perfiles done/in_progress vueltos a pending (prioridad baja). "
+        "Las reviews en staging se quedan; el wardrobe se pide en el proximo GET."
+    )
+    frontier.close()
+
+
 @app.command("retry-dead")
 def retry_dead(
     kind: str = typer.Option("", help="designer | perfume | profile; vacio = todos"),

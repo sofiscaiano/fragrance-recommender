@@ -80,7 +80,7 @@ Descubiertos en el bundle:
 - `POST /ajax.php?user_shelves` (body: `action=user_shelves&user_id=<id>`) → wardrobe (have/had/want)
 - `GET /ajax.php?view=inventory_items&user_id=<id>`
 
-Ambos responden 200 sin autenticación, **pero el payload viene cifrado con AES** (formato CryptoJS: `{"ct":...,"iv":...,"s":...}`). El passphrase de `window._pd` no está en el HTML; se recupera del bundle (ver §10).
+Ambos responden 200 sin autenticación, **pero el payload viene cifrado con AES** (formato CryptoJS: `{"ct":...,"iv":...,"s":...}`). El passphrase de `window._pd` se deriva del hostname (`www.fragrantica.com`); no está en el HTML.
 
 #### ¿Qué son exactamente los "votos sin review"?
 
@@ -97,7 +97,7 @@ Es decir: unas **29.700 personas puntuaron Sauvage sin escribir review**. Esas 2
 
 Dónde sí están: en el shelf **"My Votes"** de cada usuario, que se sirve por el endpoint `/ajax.php?user_shelves` cifrado.
 
-**Qué implica para el dataset:** sin el ajax, un usuario que reseñó 6 y puntuó 300 aparecería con 6 filas. Con el ajax (decisión del usuario, §10) esas 300 deberían entrar como `source=vote`, más los items de wardrobe como feedback implícito.
+**Qué implica para el dataset:** sin el ajax, un usuario que reseñó 6 y puntuó 300 aparecería con 6 filas. Con el ajax (decisión del usuario, §10) esas 300 entran como `source=vote` en `interactions`. Los items de wardrobe van a **otra tabla** (`wardrobe.parquet`, have/had/want): no son una calificación y no se mezclan con las reviews.
 
 **La magnitud:** en Sauvage la relación es de ~8 votos por cada review. Si se sostiene, el ajax es el salto de densidad del dataset, no un extra menor.
 
@@ -584,8 +584,8 @@ Implementación, sin navegador:
 
 - Un `POST /ajax.php?user_shelves` extra por perfil (mismo jitter/circuit breaker).
 - Payload CryptoJS `{ct,iv,s}` → AES-256-CBC, EvpKDF-MD5. El `iv` del JSON es redundante.
-- El passphrase **no** está en el HTML (`toAbby` no abre los blobs). Se recupera del bundle `/new-js/mfga2-app.js` probando literals contra un canario de la misma página.
-- Filas con `source=wardrobe|vote` y `review_id` nulo. Dedup por `(member_id, perfume_id)`, preferencia review > voto > wardrobe.
-- Si el bundle no se puede bajar (p.ej. IP en 403), la fase 3 no se cae: guarda reviews y deja los shelves para cuando se levante la penalización (o `fetch_shelves=False`).
+- El passphrase **no** está en el HTML (`toAbby` no abre los blobs). Es `window._pd("www.fragrantica.com")` (el `www.` importa); no se baja el bundle.
+- Los **votos** son interacciones (`source=vote`, `review_id` nulo). El **wardrobe** (have/had/want) es una tabla aparte (`wardrobe.parquet`): no entra al k-core ni se colapsa con la review del mismo par (usuario, item). Dedup de interacciones: review > voto.
+- Si el descifrado ajax falla, la fase 3 no se cae: guarda reviews y deja los shelves (o `fetch_shelves=False`).
 
-La señal `relation` (have/had/want) de las reviews del HTML sigue ahí; el wardrobe la complementa para perfumes que el usuario no reseñó.
+La señal `relation` (have/had/want) de las reviews del HTML sigue en la fila de la review (el formulario de voto). El wardrobe es la colección completa, en `wardrobe.parquet`.

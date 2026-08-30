@@ -323,6 +323,27 @@ class Frontier:
         cur = self.conn.execute(sql, params)
         return cur.rowcount
 
+    def requeue_done_profiles(self, *, priority: int = 90) -> int:
+        """Vuelve a pending los perfiles ya done (e in_progress abortados).
+
+        Sirve para un segundo pase: las reviews ya estan en staging y el
+        dedup de la fase 6 las absorbe; lo que falta es el POST de wardrobe
+        (el passphrase AES fallo en el primer ciclo). Baja la prioridad
+        para que los perfiles nunca visitados salgan primero.
+        """
+        now = int(time.time())
+        cur = self.conn.execute(
+            """
+            UPDATE frontier
+               SET status='pending', attempts=0, claimed_at=NULL,
+                   next_retry_at=NULL, last_error=NULL, priority=?,
+                   updated_at=?
+             WHERE kind='profile' AND status IN ('done', 'in_progress')
+            """,
+            (priority, now),
+        )
+        return cur.rowcount
+
     def entity_is_done(self, kind: Kind, entity_id: str) -> bool:
         """True si alguna URL de este entity ya se confirmo.
 

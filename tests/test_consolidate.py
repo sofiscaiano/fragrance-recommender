@@ -11,7 +11,7 @@ import pyarrow.parquet as pq
 
 from fragrantica.config import DatasetConfig
 from fragrantica.frontier import Frontier
-from fragrantica.models import Interaction, Item, User
+from fragrantica.models import Interaction, Item, User, WardrobeItem
 from fragrantica.pipeline.consolidate import consolidate
 from fragrantica.storage import ParquetWriter
 
@@ -178,7 +178,7 @@ def test_kcore_keeps_dense_subgraph(tmp_path: Path) -> None:
     fr.close()
 
 
-def test_dedup_prefers_review_over_vote_over_wardrobe(tmp_path: Path) -> None:
+def test_dedup_prefers_review_over_vote(tmp_path: Path) -> None:
     staging, final = tmp_path / "staging", tmp_path / "final"
     _write(staging, "items", [_item(1)])
     _write(
@@ -189,9 +189,37 @@ def test_dedup_prefers_review_over_vote_over_wardrobe(tmp_path: Path) -> None:
     _write(
         staging,
         "interactions_from_profile",
+        [_inter(None, 1, "alice", mid=99, rating=5, source="vote")],
+    )
+    _write(staging, "users", [_user(99, "alice", n=1)])
+    fr = Frontier(tmp_path / "f.db")
+    fr.record_member_id("alice", 99)
+
+    rep = consolidate(staging, final, fr, _cfg(k_core=1, sensitivity_k_values=(1,)))
+
+    assert rep.interactions_raw == 2
+    assert rep.interactions_deduped == 1
+    table = pq.read_table(final / "interactions.parquet")
+    assert table.column("rating").to_pylist() == [3]
+    assert table.column("source").to_pylist() == ["perfume_page"]
+    fr.close()
+
+
+def test_wardrobe_is_a_separate_table(tmp_path: Path) -> None:
+    """have/had/want no se colapsa con la review: conviven en archivos distintos."""
+    staging, final = tmp_path / "staging", tmp_path / "final"
+    _write(staging, "items", [_item(1), _item(2)])
+    _write(
+        staging,
+        "interactions_from_perfume",
+        [_inter(10, 1, "alice", rating=3, source="perfume_page")],
+    )
+    _write(
+        staging,
+        "wardrobe",
         [
-            _inter(None, 1, "alice", mid=99, rating=5, source="vote"),
-            _inter(None, 1, "alice", mid=99, rating=None, source="wardrobe"),
+            WardrobeItem(member_id=99, username_slug="alice", perfume_id=1, relation="have"),
+            WardrobeItem(member_id=99, username_slug="alice", perfume_id=2, relation="want"),
         ],
     )
     _write(staging, "users", [_user(99, "alice", n=1)])
@@ -200,11 +228,41 @@ def test_dedup_prefers_review_over_vote_over_wardrobe(tmp_path: Path) -> None:
 
     rep = consolidate(staging, final, fr, _cfg(k_core=1, sensitivity_k_values=(1,)))
 
-    assert rep.interactions_raw == 3
+    assert rep.interactions_raw == 1
     assert rep.interactions_deduped == 1
-    table = pq.read_table(final / "interactions.parquet")
-    assert table.column("rating").to_pylist() == [3]
-    assert table.column("source").to_pylist() == ["perfume_page"]
+    assert rep.wardrobe_rows == 2
+    inter = pq.read_table(final / "interactions.parquet")
+    assert inter.column("source").to_pylist() == ["perfume_page"]
+    assert "wardrobe" not in inter.column("source").to_pylist()
+    wardrobe = pq.read_table(final / "wardrobe.parquet")
+    relations = set(zip(wardrobe.column("perfume_id").to_pylist(), wardrobe.column("relation").to_pylist()))
+    assert relations == {(1, "have"), (2, "want")}
+    assert "username_slug" not in wardrobe.column_names
+    assert "user_hash" in wardrobe.column_names
+    fr.close()
+
+
+def test_wardrobe_survives_kcore_drop(tmp_path: Path) -> None:
+    """k=2 tira a alice de la matriz; su coleccion no deberia desaparecer."""
+    staging, final = tmp_path / "staging", tmp_path / "final"
+    _write(staging, "items", [_item(1), _item(2)])
+    _write(staging, "interactions_from_perfume", [_inter(10, 1, "alice")])
+    _write(
+        staging,
+        "wardrobe",
+        [
+            WardrobeItem(member_id=99, username_slug="alice", perfume_id=1, relation="have"),
+            WardrobeItem(member_id=99, username_slug="alice", perfume_id=2, relation="had"),
+        ],
+    )
+    _write(staging, "users", [_user(99, "alice", n=1)])
+    fr = Frontier(tmp_path / "f.db")
+    fr.record_member_id("alice", 99)
+
+    rep = consolidate(staging, final, fr, _cfg(k_core=2, sensitivity_k_values=(2,)))
+
+    assert rep.kcore_interactions == 0
+    assert rep.wardrobe_rows == 2
     fr.close()
 
 

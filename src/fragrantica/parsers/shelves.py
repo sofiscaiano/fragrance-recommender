@@ -1,32 +1,35 @@
 """Wardrobe y votos sin review, a partir del JSON ya descifrado.
 
 El HTML del perfil solo trae el conteo (`:wardrobe-count`) y un componente
-Vue vacio (`<member-shelfs-modern type="wardrobe|myvotes">`). Los items viven
-en `POST /ajax.php?user_shelves`. El parser no asume un esquema rigido: el
-payload no se pudo congelar todavia (el sitio esta penalizando la IP), asi
-que se recorre el JSON buscando objetos con `parfem_id` / `perfume_id`.
+Vue vacio. Los items viven en `POST /ajax.php?user_shelves`.
 
-Clasificacion:
-- contexto `myvotes` / `votes`, o un blob de votos con rating -> `source=vote`
-- `have`/`had`/`want` o contexto wardrobe -> `source=wardrobe`
-- estantes `custom` se ignoran: no son la coleccion ni el voto, y duplicarian
-  senal si el usuario tambien los tiene en el wardrobe
+Esquema verificado (ajax 200, @bansheesmile): lista de estantes
+`{type, field, value, name, perfumes:[{id, naslov, dizajner, url}]}`.
+- type=wardrobe, field=relation, value=have|had|want -> WardrobeItem
+- type=myvotes, field=rating, value=1..5 -> Interaction source=vote
+- field=for_test (y custom) se ignoran: no son la coleccion ni el voto
 
-`review_id` queda en None: estas filas no son reviews. El dedup de la fase 6
-es por (member_id, perfume_id) y prefiere review > voto > wardrobe.
+El walker viejo (claves `parfem_id` anidadas) se conserva como fallback.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any, Iterator, Literal
 
-from ..models import Interaction
+from ..models import Interaction, WardrobeItem
 from .votes import normalise_votes
 
 _PID_KEYS = ("parfem_id", "perfume_id", "perfumeId")
 _VOTE_HINTS = ("vote", "myvotes", "my_votes", "i_rated")
 _WARDROBE_HINTS = ("wardrobe", "have", "had", "want", "shelf_wardrobe")
-_SKIP_HINTS = ("custom",)
+_SKIP_HINTS = ("custom", "for_test", "for test")
+
+
+@dataclass
+class ParsedShelves:
+    votes: list[Interaction] = field(default_factory=list)
+    wardrobe: list[WardrobeItem] = field(default_factory=list)
 
 
 def parse_shelves(
@@ -34,10 +37,10 @@ def parse_shelves(
     *,
     member_id: int,
     slug: str,
-) -> list[Interaction]:
-    out: list[Interaction] = []
+) -> ParsedShelves:
+    out = ParsedShelves()
     seen: set[tuple[str, int]] = set()
-    for obj, kind in _walk(payload, None):
+    for obj, kind, ctx in _walk(payload, None, {}):
         if kind == "skip":
             continue
         pid = _perfume_id(obj)
@@ -51,6 +54,27 @@ def parse_shelves(
             continue
         seen.add(key)
 
+        ts = obj.get("vrijeme") or obj.get("timestamp") or obj.get("time")
+        timestamp = int(ts) if isinstance(ts, (int, float)) and ts > 0 else None
+
+        if source == "wardrobe":
+            rel = (
+                obj.get("relation")
+                or obj.get("status")
+                or obj.get("ownership")
+                or ctx.get("relation")
+            )
+            out.wardrobe.append(
+                WardrobeItem(
+                    member_id=member_id,
+                    username_slug=slug,
+                    perfume_id=pid,
+                    relation=rel if rel in ("have", "had", "want") else "unknown",
+                    timestamp=timestamp,
+                )
+            )
+            continue
+
         raw_votes = obj.get("perfume_votes")
         if not isinstance(raw_votes, dict):
             raw_votes = {
@@ -62,14 +86,9 @@ def parse_shelves(
                 if k in obj
             }
         votes = normalise_votes(raw_votes if raw_votes else None)
-        if source == "wardrobe" and votes["relation"] == "unknown":
-            rel = obj.get("relation") or obj.get("status") or obj.get("ownership")
-            votes["relation"] = rel if rel in ("have", "had", "want") else "unknown"
-
-        ts = obj.get("vrijeme") or obj.get("timestamp") or obj.get("time")
-        timestamp = int(ts) if isinstance(ts, (int, float)) and ts > 0 else None
-
-        out.append(
+        if votes["rating"] is None and ctx.get("rating") is not None:
+            votes["rating"] = ctx["rating"]
+        out.votes.append(
             Interaction(
                 review_id=None,
                 perfume_id=pid,
@@ -88,41 +107,67 @@ def parse_shelves(
                 night=votes["night"],
                 timestamp=timestamp,
                 review_text=None,
-                source=source,
+                source="vote",
             )
         )
     return out
 
 
-def _walk(obj: Any, kind: str | None) -> Iterator[tuple[dict, str | None]]:
+def _walk(
+    obj: Any,
+    kind: str | None,
+    ctx: dict[str, Any],
+) -> Iterator[tuple[dict, str | None, dict[str, Any]]]:
     if isinstance(obj, dict):
         here = _kind_from_label(obj) or kind
+        child_ctx = dict(ctx)
+        field = str(obj.get("field") or "").lower()
+        if field == "relation" and obj.get("value") in ("have", "had", "want"):
+            child_ctx["relation"] = obj["value"]
+        if field == "rating":
+            try:
+                rating = int(obj["value"])
+            except (TypeError, ValueError, KeyError):
+                rating = None
+            if rating is not None and 1 <= rating <= 5:
+                child_ctx["rating"] = rating
+        if field in ("for_test", "custom") or _kind_from_name(str(obj.get("name") or "")) == "skip":
+            here = "skip"
         if _perfume_id(obj) is not None:
-            yield obj, here
+            yield obj, here, child_ctx
         for key, val in obj.items():
             child_kind = _kind_from_name(str(key)) or here
-            yield from _walk(val, child_kind)
+            yield from _walk(val, child_kind, child_ctx)
     elif isinstance(obj, list):
         for item in obj:
-            yield from _walk(item, kind)
+            yield from _walk(item, kind, ctx)
 
 
 def _perfume_id(obj: dict) -> int | None:
     for key in _PID_KEYS:
-        v = obj.get(key)
-        if isinstance(v, bool) or not isinstance(v, (int, float, str)):
-            continue
-        try:
-            pid = int(v)
-        except (TypeError, ValueError):
-            continue
-        if pid > 0:
+        pid = _as_positive_int(obj.get(key))
+        if pid is not None:
             return pid
+    # Ajax user_shelves: el item usa `id` (no parfem_id). Solo si parece perfume.
+    if "naslov" in obj or "dizajner" in obj or (
+        isinstance(obj.get("url"), str) and "/perfume/" in obj["url"]
+    ):
+        return _as_positive_int(obj.get("id"))
     return None
 
 
+def _as_positive_int(v: object) -> int | None:
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return None
+    try:
+        pid = int(v)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
 def _kind_from_label(obj: dict) -> str | None:
-    for key in ("type", "shelf", "shelf_type", "name", "id", "slug"):
+    for key in ("type", "shelf", "shelf_type", "name", "slug"):
         if key in obj:
             k = _kind_from_name(str(obj[key]))
             if k:
@@ -158,5 +203,4 @@ def _classify(obj: dict, kind: str | None) -> Literal["wardrobe", "vote"] | None
     rel = obj.get("relation") or obj.get("status")
     if rel in ("have", "had", "want"):
         return "wardrobe"
-    # Item con id y sin etiqueta: entra como wardrobe (feedback implicito).
     return "wardrobe"

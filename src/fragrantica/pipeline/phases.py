@@ -20,7 +20,7 @@ from ..parsers.designer import (
 )
 from ..parsers.perfume import parse_perfume
 from ..parsers.profile import member_id_from_avatar, parse_profile
-from ..parsers.shelves import parse_shelves
+from ..parsers.shelves import ParsedShelves, parse_shelves
 from ..storage import ParquetWriter, existing_ids
 from .runner import AlreadyHave, SkipItem, run_phase
 
@@ -158,6 +158,7 @@ async def phase3_profiles(
 ) -> None:
     users = ParquetWriter(staging, "users")
     inter = ParquetWriter(staging, "interactions_from_profile")
+    wardrobe = ParquetWriter(staging, "wardrobe")
 
     mismatches = 0
 
@@ -176,20 +177,25 @@ async def phase3_profiles(
                 inferred, user.member_id, entity_id,
             )
 
-        extra = await _shelves_for_profile(client, body, user, url)
+        shelves = await _shelves_for_profile(client, body, user, url)
         frontier.record_member_id(user.username_slug, user.member_id)
         return {
             "users": [user],
-            "interactions_from_profile": interactions + extra,
+            "interactions_from_profile": interactions + shelves.votes,
+            "wardrobe": shelves.wardrobe,
         }
 
-    with users, inter:
+    with users, inter, wardrobe:
         await run_phase(
             name="Fase 3: perfiles de usuario",
             kind="profile",
             frontier=frontier,
             client=client,
-            writers={"users": users, "interactions_from_profile": inter},
+            writers={
+                "users": users,
+                "interactions_from_profile": inter,
+                "wardrobe": wardrobe,
+            },
             handler=handle,
             limit=limit,
         )
@@ -203,18 +209,21 @@ async def _shelves_for_profile(
     html: str,
     user: User,
     profile_url: str,
-) -> list:
+) -> ParsedShelves:
     """Un POST extra por perfil. RateLimited/challenge se propagan al runner.
 
     Un fallo de descifrado o de forma del JSON no tumba el perfil: las reviews
-    del HTML ya estan parseadas y no queremos mandar 13k usuarios a dead-letter
-    por un passphrase que todavia no recuperamos.
+    del HTML ya estan parseadas. El passphrase es `_pd(host)`, no el bundle.
+
+    Los votos vuelven como Interaction; el wardrobe como WardrobeItem. No se
+    mezclan: have/had/want no es una calificacion.
     """
+    empty = ParsedShelves()
     if not client.cfg.fetch_shelves or client._shelves_disabled:
-        return []
+        return empty
     pw = await client.ensure_passphrase(html)
     if not pw:
-        return []
+        return empty
     try:
         result = await client.post(
             absolute("/ajax.php?user_shelves"),
@@ -226,14 +235,14 @@ async def _shelves_for_profile(
         raise
     except ChallengeDetected as exc:
         client.disable_shelves(str(exc))
-        return []
+        return empty
     except (DecryptError, FetchError, NotFound, ValueError) as exc:
         log.warning("shelves de @%s: %s", user.username_slug, exc)
         if isinstance(exc, DecryptError):
             client._shelves_decrypt_fails += 1
             if client._shelves_decrypt_fails >= 3:
                 client.disable_shelves("descifrado ajax fallo 3 veces seguidas")
-        return []
+        return empty
     client._shelves_decrypt_fails = 0
     return parse_shelves(payload, member_id=user.member_id, slug=user.username_slug)
 

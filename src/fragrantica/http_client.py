@@ -119,8 +119,8 @@ class Client:
         self._paused_until = 0.0
         self._lock = asyncio.Lock()
         self._passphrase_lock = asyncio.Lock()
-        # Passphrase AES del bundle, compartido entre workers. None = todavia
-        # no se intento; _passphrase_failed evita reintentar en cada perfil.
+        # Passphrase AES = _pd(host). None = todavia no se calculo;
+        # _passphrase_failed evita reintentar si el canario no abre.
         self._passphrase: str | None = None
         self._passphrase_failed = False
         self._shelves_disabled = False
@@ -315,17 +315,17 @@ class Client:
         self._record(True)
         return FetchResult(url=url, status=resp.status_code, body=body, elapsed=elapsed)
 
-    async def ensure_passphrase(self, sample_html: str, *, worker: int = 0) -> str | None:
-        """Recupera el passphrase AES del bundle, una vez por proceso.
+    async def ensure_passphrase(self, sample_html: str = "", *, worker: int = 0) -> str | None:
+        """Passphrase AES = `_pd(hostname)`. Cero GET extra al bundle.
 
-        Si el JS no se puede bajar o ningun literal abre el canario, devuelve
-        None y no se vuelve a intentar: fallar en cada perfil duplicaria 429.
+        Si el HTML trae un blob canario y no abre, se corta: el ajax tampoco
+        va a cerrar y no vale gastar un POST por perfil.
         """
         from .parsers.crypto import (
             DecryptError,
-            bundle_path_from_html,
+            decrypt_cryptojs,
             encrypted_blobs_from_html,
-            recover_passphrase,
+            passphrase_from_host,
         )
 
         async with self._passphrase_lock:
@@ -334,28 +334,24 @@ class Client:
             if self._passphrase_failed:
                 return None
 
-            blobs = encrypted_blobs_from_html(sample_html)
-            sample = blobs.get("favorite_shelf") or next(iter(blobs.values()), None)
-            if sample is None:
-                self._passphrase_failed = True
-                log.warning("sin blob canario en el HTML; no se descifran shelves")
-                return None
+            pw = passphrase_from_host()
+            blobs = encrypted_blobs_from_html(sample_html) if sample_html else {}
+            sample = (
+                blobs.get("memberHomeData")
+                or blobs.get("favorite_shelf")
+                or next(iter(blobs.values()), None)
+            )
+            if sample is not None:
+                try:
+                    import orjson
 
-            try:
-                js = await self.fetch(
-                    absolute(bundle_path_from_html(sample_html)),
-                    worker=worker,
-                    kind="js",
-                )
-                pw = recover_passphrase(js.body, sample)
-            except RateLimited:
-                raise
-            except (DecryptError, ChallengeDetected, FetchError, NotFound) as exc:
-                self._passphrase_failed = True
-                log.warning("no se recupero el passphrase AES: %s", exc)
-                return None
+                    orjson.loads(decrypt_cryptojs(sample, pw))
+                except (DecryptError, ValueError) as exc:
+                    self._passphrase_failed = True
+                    log.warning("passphrase _pd(host) no abre el canario: %s", exc)
+                    return None
             self._passphrase = pw
-            log.info("passphrase AES recuperado del bundle (%d chars)", len(pw))
+            log.info("passphrase AES derivado de _pd(%s)", "www.fragrantica.com")
             return pw
 
     def disable_shelves(self, reason: str) -> None:

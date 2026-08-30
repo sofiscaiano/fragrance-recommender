@@ -106,16 +106,44 @@ class User(BaseModel):
         return v.strip().lower()
 
 
-class Interaction(BaseModel):
-    """Un par (usuario, item): review, voto sin review, o item de wardrobe.
+class WardrobeItem(BaseModel):
+    """Un perfume en la coleccion del miembro (have / had / want).
 
-    perfume_id viene siempre. member_id NO esta en la pagina de perfume (solo
-    el username), asi que se resuelve en la fase 4 por username_slug. Antes
-    del export se valida que no queden nulos. El dedup final es por
-    (member_id, perfume_id) y se queda con la fila mas informativa.
+    No es una interaccion de rating: el usuario no califico ni reseño, solo
+    lo guardo. Vive en su propia tabla para no contaminar la matriz con la
+    que se entrena el recomendador. `relation=unknown` se admite porque el
+    JSON del ajax no esta congelado y a veces el estante no trae el status.
     """
 
-    # None en wardrobe / votos sin review: esas filas no tienen review_id.
+    member_id: int
+    username_slug: str
+    perfume_id: int
+    relation: Relation = "unknown"
+    timestamp: int | None = None
+
+    @field_validator("username_slug")
+    @classmethod
+    def _normalise_slug(cls, v: str) -> str:
+        return v.strip().lower()
+
+    @field_validator("perfume_id")
+    @classmethod
+    def _positive_id(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("perfume_id debe ser positivo")
+        return v
+
+
+class Interaction(BaseModel):
+    """Un par (usuario, item) con senal explicita: review o voto sin texto.
+
+    El wardrobe NO entra aca (ver WardrobeItem). perfume_id viene siempre.
+    member_id NO esta en la pagina de perfume (solo el username), asi que se
+    resuelve en la fase 4 por username_slug. El dedup final es por
+    (member_id, perfume_id) y prefiere review sobre voto.
+    """
+
+    # None en votos sin review: esas filas no tienen review_id.
     review_id: int | None = None
     perfume_id: int
     member_id: int | None = None
@@ -137,7 +165,7 @@ class Interaction(BaseModel):
     timestamp: int | None = None
     review_text: str | None = None
 
-    source: Literal["perfume_page", "profile_page", "wardrobe", "vote"] = "perfume_page"
+    source: Literal["perfume_page", "profile_page", "vote"] = "perfume_page"
 
     @field_validator("username_slug")
     @classmethod

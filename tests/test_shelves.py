@@ -29,21 +29,22 @@ def test_wardrobe_and_votes_from_named_keys():
         ],
         "custom": [{"parfem_id": 99, "relation": "have"}],
     }
-    rows = parse_shelves(payload, member_id=3158387, slug="quilter")
-    sources = {(r.source, r.perfume_id) for r in rows}
-    assert ("wardrobe", 31861) in sources
-    assert ("wardrobe", 109081) in sources
-    assert ("vote", 1) in sources
+    parsed = parse_shelves(payload, member_id=3158387, slug="quilter")
+    wardrobe_ids = {r.perfume_id for r in parsed.wardrobe}
+    vote_ids = {r.perfume_id for r in parsed.votes}
+    assert wardrobe_ids == {31861, 109081}
+    assert vote_ids == {1}
     # Los estantes custom no son la coleccion ni el voto.
-    assert ("wardrobe", 99) not in sources
-    assert all(r.review_id is None for r in rows)
-    assert all(r.member_id == 3158387 for r in rows)
-    have = next(r for r in rows if r.perfume_id == 31861)
+    assert 99 not in wardrobe_ids
+    assert all(r.review_id is None for r in parsed.votes)
+    assert all(r.member_id == 3158387 for r in parsed.votes)
+    assert all(r.member_id == 3158387 for r in parsed.wardrobe)
+    have = next(r for r in parsed.wardrobe if r.perfume_id == 31861)
     assert have.relation == "have"
-    assert have.rating is None
-    vote = next(r for r in rows if r.perfume_id == 1)
+    vote = next(r for r in parsed.votes if r.perfume_id == 1)
     assert vote.rating == 5
     assert vote.season_winter == 1
+    assert vote.source == "vote"
 
 
 def test_list_of_typed_shelves():
@@ -51,17 +52,67 @@ def test_list_of_typed_shelves():
         {"type": "wardrobe", "items": [{"perfume_id": 10, "relation": "want"}]},
         {"type": "myvotes", "items": [{"parfem_id": 2, "rating": 4}]},
     ]
-    rows = parse_shelves(payload, member_id=1, slug="u")
-    by_src = {r.source: r for r in rows}
-    assert by_src["wardrobe"].perfume_id == 10
-    assert by_src["wardrobe"].relation == "want"
-    assert by_src["vote"].perfume_id == 2
-    assert by_src["vote"].rating == 4
+    parsed = parse_shelves(payload, member_id=1, slug="u")
+    assert len(parsed.wardrobe) == 1
+    assert parsed.wardrobe[0].perfume_id == 10
+    assert parsed.wardrobe[0].relation == "want"
+    assert len(parsed.votes) == 1
+    assert parsed.votes[0].perfume_id == 2
+    assert parsed.votes[0].rating == 4
 
 
 def test_rating_zero_on_vote_is_absent():
     payload = {"myvotes": [{"parfem_id": 7, "perfume_votes": {"rating": 0, "longevity": 0}}]}
-    rows = parse_shelves(payload, member_id=1, slug="u")
-    assert len(rows) == 1
-    assert rows[0].source == "vote"
-    assert rows[0].rating is None
+    parsed = parse_shelves(payload, member_id=1, slug="u")
+    assert parsed.wardrobe == []
+    assert len(parsed.votes) == 1
+    assert parsed.votes[0].source == "vote"
+    assert parsed.votes[0].rating is None
+
+
+def test_ajax_shelves_use_id_and_shelf_value():
+    """Payload vivo: perfumes[].id y have/had/want / rating en el estante."""
+    payload = [
+        {
+            "field": "relation",
+            "value": "have",
+            "name": "Perfumes I Have",
+            "type": "wardrobe",
+            "perfumes": [
+                {"id": 219, "naslov": "Hypnotic Poison", "dizajner": "Dior",
+                 "url": "/perfume/Dior/Hypnotic-Poison-219.html"},
+            ],
+        },
+        {
+            "field": "rating",
+            "value": 5,
+            "name": "love",
+            "type": "myvotes",
+            "perfumes": [
+                {"id": 15452, "naslov": "Alien Essence Absolue", "dizajner": "Mugler",
+                 "url": "/perfume/Mugler/Alien-Essence-Absolue-15452.html"},
+            ],
+        },
+        {
+            "field": "for_test",
+            "value": 1,
+            "name": "for test",
+            "type": "wardrobe",
+            "perfumes": [
+                {"id": 99, "naslov": "Skip me", "dizajner": "X",
+                 "url": "/perfume/X/Skip-99.html"},
+            ],
+        },
+    ]
+    parsed = parse_shelves(payload, member_id=1986300, slug="bansheesmile")
+    assert [(w.perfume_id, w.relation) for w in parsed.wardrobe] == [(219, "have")]
+    assert len(parsed.votes) == 1
+    assert parsed.votes[0].perfume_id == 15452
+    assert parsed.votes[0].rating == 5
+    assert parsed.votes[0].source == "vote"
+    payload = {"myvotes": [{"parfem_id": 7, "perfume_votes": {"rating": 0, "longevity": 0}}]}
+    parsed = parse_shelves(payload, member_id=1, slug="u")
+    assert parsed.wardrobe == []
+    assert len(parsed.votes) == 1
+    assert parsed.votes[0].source == "vote"
+    assert parsed.votes[0].rating is None

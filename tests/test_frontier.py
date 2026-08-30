@@ -217,6 +217,28 @@ def test_drop_profiles_except(fr):
     assert left == {"alice", "bob"}
 
 
+def test_requeue_done_profiles_leaves_never_visited_first(fr):
+    fr.add("https://www.fragrantica.com/@alice", "profile", "alice", priority=60)
+    fr.add("https://www.fragrantica.com/@bob", "profile", "bob", priority=60)
+    fr.add("https://www.fragrantica.com/@carol", "profile", "carol", priority=60)
+    fr.claim("profile", 1)
+    fr.mark_done("https://www.fragrantica.com/@alice")
+    fr.claim("profile", 1)  # bob queda in_progress
+    n = fr.requeue_done_profiles()
+    assert n == 2
+    stats = fr.stats()
+    assert stats[("profile", "pending")] == 3
+    pri = {
+        r["entity_id"]: r["priority"]
+        for r in fr.conn.execute("SELECT entity_id, priority FROM frontier")
+    }
+    assert pri["alice"] == 90
+    assert pri["bob"] == 90
+    assert pri["carol"] == 60
+    first = fr.claim("profile", 1)[0]["entity_id"]
+    assert first == "carol"
+
+
 def test_entity_is_done(fr):
     fr.add("https://x/1", "perfume", "31861")
     assert fr.entity_is_done("perfume", "31861") is False

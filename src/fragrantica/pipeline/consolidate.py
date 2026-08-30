@@ -34,6 +34,7 @@ class ConsolidationReport:
     kcore_items: int = 0
     kcore_users: int = 0
     kcore_iterations: int = 0
+    wardrobe_rows: int = 0
     orphan_item_ids: list[int] | None = None
 
     def to_dict(self) -> dict:
@@ -95,10 +96,11 @@ def consolidate(
 
     # ---- dedup por (usuario, item) --------------------------------------
     # La misma review puede llegar por perfume_page y profile_page. Un voto
-    # o un item de wardrobe pueden coexistir con esa review. El recomendador
-    # quiere un par (user, item); se queda con la fila mas informativa.
-    # Ojo: NO deduplicar solo por review_id. Los votos/wardrobe tienen
-    # review_id NULL y un PARTITION BY review_id los colapsaria a una sola fila.
+    # sin texto puede coexistir con esa review. El recomendador quiere un
+    # par (user, item) con senal explicita; se queda con la fila mas
+    # informativa. El wardrobe NO entra: es otra tabla.
+    # Ojo: NO deduplicar solo por review_id. Los votos tienen review_id NULL
+    # y un PARTITION BY review_id los colapsaria a una sola fila.
     con.execute(
         """
         CREATE TABLE inter_dedup AS
@@ -109,8 +111,7 @@ def consolidate(
                              WHEN 'profile_page' THEN 0
                              WHEN 'perfume_page' THEN 1
                              WHEN 'vote' THEN 2
-                             WHEN 'wardrobe' THEN 3
-                             ELSE 4
+                             ELSE 3
                          END,
                          review_id IS NULL,
                          rating IS NULL
@@ -162,6 +163,52 @@ def consolidate(
             """
         )
 
+    # ---- wardrobe (tabla aparte, no entra al k-core) ---------------------
+    # have/had/want no es una calificacion. Se exporta con integridad
+    # referencial contra users+items, sin filtrar por k-core: un perfume
+    # en la coleccion no deberia desaparecer porque el usuario no llego
+    # al umbral de reviews.
+    wardrobe_src = _glob(staging, "wardrobe")
+    if wardrobe_src:
+        con.execute(f"CREATE TABLE wardrobe_raw AS SELECT * FROM read_parquet('{wardrobe_src}')")
+        con.execute(
+            """
+            CREATE TABLE wardrobe_resolved AS
+            SELECT w.* REPLACE (COALESCE(w.member_id, m.member_id) AS member_id)
+            FROM wardrobe_raw w
+            LEFT JOIN slug_map m USING (username_slug)
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE wardrobe_dedup AS
+            SELECT * EXCLUDE (rn) FROM (
+                SELECT *, row_number() OVER (
+                    PARTITION BY COALESCE(member_id, -1), perfume_id
+                    ORDER BY CASE relation
+                                 WHEN 'have' THEN 0
+                                 WHEN 'had' THEN 1
+                                 WHEN 'want' THEN 2
+                                 ELSE 3
+                             END
+                ) AS rn
+                FROM wardrobe_resolved
+            ) WHERE rn = 1
+            """
+        )
+    else:
+        con.execute(
+            """
+            CREATE TABLE wardrobe_dedup AS
+            SELECT NULL::BIGINT AS member_id,
+                   NULL::VARCHAR AS username_slug,
+                   NULL::BIGINT AS perfume_id,
+                   NULL::VARCHAR AS relation,
+                   NULL::BIGINT AS timestamp
+            WHERE false
+            """
+        )
+
     # ---- integridad referencial ------------------------------------------
     rep.dropped_null_member = con.execute(
         "SELECT count(*) FROM inter_dedup WHERE member_id IS NULL"
@@ -172,7 +219,12 @@ def consolidate(
         for r in con.execute(
             """
             SELECT DISTINCT i.perfume_id
-            FROM inter_dedup i LEFT JOIN items t USING (perfume_id)
+            FROM (
+                SELECT perfume_id FROM inter_dedup
+                UNION
+                SELECT perfume_id FROM wardrobe_dedup WHERE perfume_id IS NOT NULL
+            ) i
+            LEFT JOIN items t USING (perfume_id)
             WHERE t.perfume_id IS NULL
             """
         ).fetchall()
@@ -249,6 +301,27 @@ def consolidate(
         ) TO '{final / "users.parquet"}' (FORMAT PARQUET, COMPRESSION ZSTD)"""
     )
 
+    # Coleccion have/had/want: usuarios e items del catalogo crawleado, no
+    # del k-core. El hash usa el mismo salt que interactions.
+    con.execute(
+        f"""COPY (
+            SELECT w.* EXCLUDE (username_slug),
+                   substr(sha256(w.username_slug || '{salt_sql}'), 1, 16) AS user_hash
+            FROM wardrobe_dedup w
+            JOIN items t USING (perfume_id)
+            JOIN users u USING (member_id)
+            WHERE w.member_id IS NOT NULL
+        ) TO '{final / "wardrobe.parquet"}' (FORMAT PARQUET, COMPRESSION ZSTD)"""
+    )
+    rep.wardrobe_rows = con.execute(
+        """
+        SELECT count(*) FROM wardrobe_dedup w
+        JOIN items t USING (perfume_id)
+        JOIN users u USING (member_id)
+        WHERE w.member_id IS NOT NULL
+        """
+    ).fetchone()[0]
+
     # El mapeo hash -> username queda aparte, fuera del dataset publicable.
     con.execute(
         f"""COPY (
@@ -320,8 +393,14 @@ def _write_dataset_card(
     period = con.execute(
         "SELECT min(timestamp), max(timestamp) FROM kcore WHERE timestamp IS NOT NULL"
     ).fetchone()
-    relations = con.execute(
-        "SELECT relation, count(*) FROM kcore GROUP BY 1 ORDER BY 2 DESC"
+    wardrobe_rel = con.execute(
+        """
+        SELECT relation, count(*) FROM wardrobe_dedup w
+        JOIN items t USING (perfume_id)
+        JOIN users u USING (member_id)
+        WHERE w.member_id IS NOT NULL
+        GROUP BY 1 ORDER BY 2 DESC
+        """
     ).fetchall()
 
     import datetime as dt
@@ -342,6 +421,7 @@ def _write_dataset_card(
         f"- **Dataset final (k-core k={cfg.k_core}): {rep.kcore_interactions:,} interacciones, "
         f"{rep.kcore_users:,} usuarios, {rep.kcore_items:,} items**",
         f"- Iteraciones hasta punto fijo del k-core: {rep.kcore_iterations}",
+        f"- Wardrobe (have/had/want, tabla aparte, sin k-core): {rep.wardrobe_rows:,}",
         "",
         "## Descartes",
         "",
@@ -356,12 +436,15 @@ def _write_dataset_card(
     lines += [f"| {r[0]} | {r[1]:,} |" for r in dist]
     lines += [
         "",
-        "## Relacion con el perfume (feedback implicito)",
+        "## Wardrobe (coleccion, no entra a la matriz de ratings)",
+        "",
+        f"{rep.wardrobe_rows:,} filas en `wardrobe.parquet`. Un usuario puede "
+        "tener un perfume en la coleccion y ademas una review; no se colapsan.",
         "",
         "| relation | n |",
         "|---|---|",
     ]
-    lines += [f"| {r[0]} | {r[1]:,} |" for r in relations]
+    lines += [f"| {r[0]} | {r[1]:,} |" for r in wardrobe_rel] or ["| (vacio) | 0 |"]
     lines += [
         "",
         f"## Periodo cubierto\n\n{fmt(period[0])} a {fmt(period[1])}",
@@ -379,13 +462,12 @@ def _write_dataset_card(
         "",
         "## Limitaciones conocidas",
         "",
-        "- **Wardrobe y votos sin review.** Ademas de las reviews del HTML, la",
-        "  fase 3 pide `POST /ajax.php?user_shelves` (robots.txt lo prohibe;",
-        "  decision explicita) y descifra el payload AES. Esas filas entran",
-        "  con `source=wardrobe` o `source=vote` y `review_id` nulo. El dedup",
-        "  se queda con una fila por par (usuario, item), preferiendo review",
-        "  sobre voto sobre wardrobe. Si el passphrase del bundle no se",
-        "  pudo recuperar, esas filas no estan y el dataset cubre solo reviews.",
+        "- **Wardrobe vs interacciones.** `interactions.parquet` son reviews y",
+        "  votos (calificacion explicita). `wardrobe.parquet` es la coleccion",
+        "  have/had/want, tabla aparte: no entra al k-core ni se deduplica",
+        "  contra las reviews. Los votos sin review siguen en interacciones",
+        "  con `source=vote`. Si el passphrase AES no se recupero, ambas",
+        "  tablas ajax quedan vacias y el dataset cubre solo reviews del HTML.",
         "- **Truncado de reviews por item.** El sitio renderiza ~200 reviews para",
         "  visitantes anonimos; el archivo completo requiere login. Los items",
         "  marcados con `reviews_truncated` tienen su cola cubierta solo en la",
@@ -418,6 +500,7 @@ def _print_report(rep: ConsolidationReport, sensitivity: list[dict]) -> None:
     t.add_row("[bold]final k-core[/bold]", f"[bold]{rep.kcore_interactions:,}[/bold]")
     t.add_row("usuarios finales", f"{rep.kcore_users:,}")
     t.add_row("items finales", f"{rep.kcore_items:,}")
+    t.add_row("wardrobe (tabla aparte)", f"{rep.wardrobe_rows:,}")
     console.print(t)
 
     s = Table(title="Sensibilidad al umbral k")
