@@ -29,14 +29,13 @@ class CrawlConfig:
 
     # Un solo worker. El 429 es ritmo AGREGADO: 6 en paralelo (~5 req/s)
     # lo dispararon a los ~150 requests. Subir concurrency duplica conexiones
-    # TLS desde la misma IP; bajar el delay de un worker no. 10-20 s es el
-    # paso intermedio: 20-40 s banco ~88 paginas; 2-5 s en IP nueva no.
+    # TLS desde la misma IP; bajar el delay de un worker no.
     concurrency: int = 1
 
     # Jitter uniforme por worker. Un delay fijo es en si mismo una firma de bot,
     # mas detectable que ir un poco mas rapido de forma irregular.
-    delay_min: float = field(default_factory=lambda: _env_float("FRAGRANTICA_DELAY_MIN", 10.0))
-    delay_max: float = field(default_factory=lambda: _env_float("FRAGRANTICA_DELAY_MAX", 20.0))
+    delay_min: float = field(default_factory=lambda: _env_float("FRAGRANTICA_DELAY_MIN", 5))
+    delay_max: float = field(default_factory=lambda: _env_float("FRAGRANTICA_DELAY_MAX", 10))
 
     timeout: float = 45.0
     max_attempts: int = 6
