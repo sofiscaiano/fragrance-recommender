@@ -19,6 +19,12 @@ def _env_float(name: str, default: float) -> float:
     return float(raw)
 
 
+def _env_csv(name: str) -> tuple[str, ...]:
+    return tuple(
+        p.strip() for p in os.environ.get(name, "").split(",") if p.strip()
+    )
+
+
 @dataclass(frozen=True)
 class CrawlConfig:
     """Parametros de red y de cortesia.
@@ -76,12 +82,13 @@ class CrawlConfig:
 
     # Capa 3 del plan: una IP nueva (hotspot o residencial) cuando Cloudflare
     # penalizo la nuestra. Vacio = salir directo. Varias URLs separadas por coma.
-    proxies: tuple[str, ...] = field(
-        default_factory=lambda: tuple(
-            p.strip()
-            for p in os.environ.get("FRAGRANTICA_PROXY", "").split(",")
-            if p.strip()
-        )
+    proxies: tuple[str, ...] = field(default_factory=lambda: _env_csv("FRAGRANTICA_PROXY"))
+
+    # Solo el POST de wardrobe. Independiente de FRAGRANTICA_PROXY: si HTML
+    # y ajax salen por la misma IP, el 70/19 se muda al residencial.
+    # Vacio = el POST usa la misma salida que el GET (casa o FRAGRANTICA_PROXY).
+    shelves_proxies: tuple[str, ...] = field(
+        default_factory=lambda: _env_csv("FRAGRANTICA_SHELVES_PROXY")
     )
 
     # Si la tasa de challenges supera este umbral, el circuit breaker frena.
@@ -94,6 +101,14 @@ class CrawlConfig:
     # prohibe; decision explicita de incluir wardrobe y votos sin review).
     # Si el descifrado falla, la fase 3 sigue con las reviews del HTML.
     fetch_shelves: bool = True
+
+    # Pausa de los POST (no del HTML) tras un 429 en user_shelves. Una noche
+    # de fase 3 midio bursts exactos de 70 y 19 perfiles: 15 min no vacian
+    # la ventana de Cloudflare y el burst corto pide con el cupo caliente.
+    # 45 min deja caer el burst de 70; el HTML sigue recolectando member_id.
+    shelves_cooldown: float = field(
+        default_factory=lambda: _env_float("FRAGRANTICA_SHELVES_COOLDOWN", 2700.0)
+    )
 
 
 @dataclass(frozen=True)

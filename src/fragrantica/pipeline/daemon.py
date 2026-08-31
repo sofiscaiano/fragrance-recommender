@@ -69,6 +69,8 @@ def next_phase(frontier: Frontier) -> int | None:
         )
         if n:
             return phase
+    if frontier.shelves_has_work():
+        return 3
     return None
 
 
@@ -212,7 +214,7 @@ async def run_daemon(
         phase = next_phase(frontier)
         if phase is None:
             console.print(
-                "[bold green]Colas de perfume y perfil vacias.[/bold green] "
+                "[bold green]Colas de perfume, perfil y shelves vacias.[/bold green] "
                 "Siguiente: [bold]fragrantica phase 6[/bold] (local, sin red)."
             )
             return

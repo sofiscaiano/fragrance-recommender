@@ -136,9 +136,10 @@ sostenida**, algo que un burst corto de prueba no detecta:
 | 1 worker, jitter 20–40 s + daemon | ~88 páginas OK; no duplicar workers |
 | 1 worker, jitter 10–20 s + daemon | default actual |
 
-`daemon` es el modo para terminar el slice: un worker, 10–20 s entre
-requests. El catálogo completo (137k items, ~2M perfiles) no entra en una IP
-hogareña; ahí `FRAGRANTICA_PROXY` tiene que ser residencial.
+`daemon` es el modo para terminar el slice: HTML por la IP hogareña,
+wardrobe por `FRAGRANTICA_SHELVES_PROXY` si está definido (residencial,
+solo el POST). El catálogo completo no entra en una IP hogareña; ahí
+`FRAGRANTICA_PROXY` tiene que ser residencial para las páginas.
 
 ## Tests
 

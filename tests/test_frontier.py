@@ -245,3 +245,37 @@ def test_entity_is_done(fr):
     fr.claim("perfume", 1)
     fr.mark_done("https://x/1")
     assert fr.entity_is_done("perfume", "31861") is True
+
+
+def test_shelves_enqueue_claim_done_idempotent(fr):
+    assert fr.enqueue_shelves(1, "Alice", "https://www.fragrantica.com/@alice") is True
+    assert fr.enqueue_shelves(1, "alice", "https://www.fragrantica.com/@alice") is False
+    assert fr.shelves_pending_count() == 1
+    job = fr.claim_shelves(1)[0]
+    assert job["member_id"] == 1
+    assert job["slug"] == "alice"
+    assert fr.claim_shelves(1) == []
+    fr.mark_shelves_done(1)
+    assert fr.shelves_stats() == {"done": 1}
+    assert fr.enqueue_shelves(1, "alice", "https://x") is False
+    assert fr.shelves_has_work() is False
+
+
+def test_shelves_429_requeue_does_not_count_attempt(fr):
+    fr.enqueue_shelves(7, "u", "https://www.fragrantica.com/@u")
+    fr.claim_shelves(1)
+    fr.requeue_shelves(7, "HTTP 429", delay=0)
+    row = fr.conn.execute("SELECT attempts, status FROM shelves_jobs").fetchone()
+    assert row["attempts"] == 0
+    assert row["status"] == "pending"
+    assert fr.shelves_has_work() is True
+
+
+def test_reclaim_stale_includes_shelves_jobs(fr):
+    fr.enqueue_shelves(3, "z", "https://www.fragrantica.com/@z")
+    fr.claim_shelves(1)
+    assert fr.reclaim_stale(lease_timeout=900) == 0
+    fr.conn.execute("UPDATE shelves_jobs SET claimed_at = ?", (int(time.time()) - 1000,))
+    assert fr.reclaim_stale(lease_timeout=900) == 1
+    assert fr.shelves_pending_count() == 1
+

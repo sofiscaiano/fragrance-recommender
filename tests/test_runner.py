@@ -156,3 +156,43 @@ async def test_interstitial_stops_when_canary_fails(tmp_path: Path) -> None:
     row = fr.conn.execute("SELECT status FROM frontier").fetchone()
     assert row["status"] == "pending"
     fr.close()
+
+
+@pytest.mark.asyncio
+async def test_ajax_429_does_not_stop_profile_phase(tmp_path: Path) -> None:
+    """El GET del perfil se confirma done; el POST queda en shelves_jobs."""
+    from fragrantica.http_client import FetchResult
+    from fragrantica.models import User
+    from fragrantica.pipeline.phases import enqueue_missing_shelves
+
+    class _HtmlOk:
+        async def fetch(self, url: str, *, worker: int = 0, referer=None, kind="html"):
+            # parse_profile needs real-ish html? handler is custom
+            return FetchResult(url=url, status=200, body="<html>", elapsed=0.0)
+
+    fr = Frontier(tmp_path / "f.db")
+    fr.add("https://www.fragrantica.com/@one", "profile", "one")
+    writer = ParquetWriter(tmp_path, "users")
+    user = User(member_id=42, username_slug="one")
+
+    async def handler(url: str, entity_id: str, body: str) -> dict:
+        fr.record_member_id(user.username_slug, user.member_id)
+        fr.enqueue_shelves(user.member_id, user.username_slug, url)
+        return {"users": [user]}
+
+    with writer:
+        stats = await run_phase(
+            name="test",
+            kind="profile",
+            frontier=fr,
+            client=_HtmlOk(),
+            writers={"users": writer},
+            handler=handler,
+        )
+    assert stats.done == 1
+    assert stats.rate_limited == 0
+    assert fr.conn.execute("SELECT status FROM frontier").fetchone()["status"] == "done"
+    assert fr.shelves_pending_count() == 1
+    # backfill no duplica
+    assert enqueue_missing_shelves(fr, tmp_path) == 0
+    fr.close()

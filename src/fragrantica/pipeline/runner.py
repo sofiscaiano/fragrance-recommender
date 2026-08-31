@@ -159,8 +159,10 @@ async def run_phase(
             frontier.mark_skipped(url, str(exc))
             stats.skipped += 1
         except RateLimited as exc:
-            # El 429 no es culpa de esta URL. Vuelve a pending y se CORTA el
-            # proceso: pausar 5 min y seguir era lo que escalaba a 403 de IP.
+            # 429 de pagina: no es culpa de esta URL. Vuelve a pending y se
+            # CORTA el ciclo. El 429 de ajax lo traga `_shelves_for_profile`
+            # (pausa los POST, el HTML se confirma done). Pausar 5 min y
+            # seguir en caliente era lo que escalaba a 403 de IP.
             frontier.requeue(url, str(exc), delay=exc.retry_after or cfg.rate_limit_pause)
             stats.rate_limited += 1
             halt = StopCrawl("HTTP 429: el sitio pidio bajar el ritmo", reason="429")

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
 from rich.console import Console
 
-from ..config import CRAWL, DATASET, DatasetConfig
-from ..frontier import Frontier
+from ..config import BASE_URL, CRAWL, DATASET, DatasetConfig
+from ..frontier import Frontier, backoff_delay
 from ..http_client import ChallengeDetected, Client, FetchError, NotFound, RateLimited, absolute
 from ..models import User
 from ..parsers.crypto import DecryptError, unwrap_ajax_body
@@ -21,7 +22,7 @@ from ..parsers.designer import (
 from ..parsers.perfume import parse_perfume
 from ..parsers.profile import member_id_from_avatar, parse_profile
 from ..parsers.shelves import ParsedShelves, parse_shelves
-from ..storage import ParquetWriter, existing_ids
+from ..storage import ParquetWriter, existing_ids, existing_int_ids
 from .runner import AlreadyHave, SkipItem, run_phase
 
 log = logging.getLogger(__name__)
@@ -158,9 +159,14 @@ async def phase3_profiles(
 ) -> None:
     users = ParquetWriter(staging, "users")
     inter = ParquetWriter(staging, "interactions_from_profile")
+    votes_out = ParquetWriter(staging, "interactions_from_profile")
     wardrobe = ParquetWriter(staging, "wardrobe")
 
     mismatches = 0
+    if client.cfg.fetch_shelves:
+        n = enqueue_missing_shelves(frontier, staging)
+        if n:
+            console.print(f"[bold]Shelves[/bold]: {n} perfiles ya crawleados sin closet, encolados")
 
     async def handle(url: str, entity_id: str, body: str) -> dict[str, list]:
         nonlocal mismatches
@@ -177,31 +183,141 @@ async def phase3_profiles(
                 inferred, user.member_id, entity_id,
             )
 
-        shelves = await _shelves_for_profile(client, body, user, url)
         frontier.record_member_id(user.username_slug, user.member_id)
+        if client.cfg.fetch_shelves:
+            frontier.enqueue_shelves(user.member_id, user.username_slug, url)
         return {
             "users": [user],
-            "interactions_from_profile": interactions + shelves.votes,
-            "wardrobe": shelves.wardrobe,
+            "interactions_from_profile": interactions,
         }
 
-    with users, inter, wardrobe:
-        await run_phase(
-            name="Fase 3: perfiles de usuario",
-            kind="profile",
-            frontier=frontier,
-            client=client,
-            writers={
-                "users": users,
-                "interactions_from_profile": inter,
-                "wardrobe": wardrobe,
-            },
-            handler=handle,
-            limit=limit,
-        )
+    html_error: BaseException | None = None
+
+    async def run_html() -> None:
+        nonlocal html_error
+        try:
+            with users, inter:
+                await run_phase(
+                    name="Fase 3: perfiles de usuario",
+                    kind="profile",
+                    frontier=frontier,
+                    client=client,
+                    writers={
+                        "users": users,
+                        "interactions_from_profile": inter,
+                    },
+                    handler=handle,
+                    limit=limit,
+                )
+        except BaseException as exc:
+            html_error = exc
+            raise
+
+    html_task = asyncio.create_task(run_html())
+    try:
+        with votes_out, wardrobe:
+            if client.cfg.fetch_shelves:
+                await run_shelves_loop(
+                    frontier, client, votes_out, wardrobe, html_task
+                )
+            await html_task
+    except BaseException:
+        if not html_task.done():
+            html_task.cancel()
+            try:
+                await html_task
+            except BaseException:
+                pass
+        raise
 
     if mismatches:
         console.print(f"[yellow]  {mismatches} discrepancias de member_id via avatar[/yellow]")
+    if html_error is not None:
+        raise html_error
+
+
+def enqueue_missing_shelves(frontier: Frontier, staging: Path) -> int:
+    """Encola member_id con HTML ya parseado y sin filas en wardrobe.
+
+    No vuelve a pedir el perfil. Quien ya tiene closet no se toca. Quien
+    tiene closet vacio se pide una vez; despues queda done en shelves_jobs.
+    """
+    have = existing_int_ids(staging / "wardrobe", "member_id")
+    rows: list[tuple[int, str, str]] = []
+    for slug, mid in frontier.member_id_map().items():
+        if mid in have:
+            continue
+        rows.append((mid, slug, f"{BASE_URL}/@{slug}"))
+    return frontier.enqueue_shelves_many(rows)
+
+
+async def run_shelves_loop(
+    frontier: Frontier,
+    client: Client,
+    votes_writer: ParquetWriter,
+    wardrobe_writer: ParquetWriter,
+    html_task: asyncio.Task,
+) -> None:
+    """Consume shelves_jobs. Un 429 pausa este loop, no el GET del perfil."""
+    frontier.reclaim_stale(client.cfg.lease_timeout_seconds)
+
+    while True:
+        if client._shelves_disabled or not client.cfg.fetch_shelves:
+            return
+        if client.shelves_paused():
+            await asyncio.sleep(2.0)
+            continue
+        if not client.should_fetch_shelves():
+            await asyncio.sleep(2.0)
+            continue
+
+        rows = frontier.claim_shelves(1)
+        if not rows:
+            html_done = html_task.done()
+            html_failed = html_done and (
+                html_task.cancelled()
+                or html_task.exception() is not None
+            )
+            if html_failed and not client.cfg.shelves_proxies:
+                return
+            if (
+                html_done
+                and frontier.shelves_pending_count() == 0
+                and frontier.shelves_waiting_count() == 0
+                and frontier.shelves_in_flight_count() == 0
+            ):
+                return
+            await asyncio.sleep(1.0)
+            continue
+
+        job = rows[0]
+        mid = int(job["member_id"])
+        slug = str(job["slug"])
+        profile_url = str(job["profile_url"])
+        user = User(member_id=mid, username_slug=slug)
+        try:
+            parsed = await _shelves_for_profile(client, "", user, profile_url)
+        except RateLimited as exc:
+            frontier.requeue_shelves(mid, str(exc), client.cfg.shelves_cooldown)
+            continue
+        except ChallengeDetected as exc:
+            frontier.requeue_shelves(mid, str(exc), client.cfg.shelves_cooldown)
+            continue
+        except FetchError as exc:
+            delay = backoff_delay(
+                int(job["attempts"]) + 1,
+                client.cfg.backoff_base,
+                client.cfg.backoff_cap,
+            )
+            frontier.mark_shelves_failed(mid, str(exc), client.cfg.max_attempts, delay)
+            continue
+        if parsed.votes:
+            votes_writer.add_many(parsed.votes)
+        if parsed.wardrobe:
+            wardrobe_writer.add_many(parsed.wardrobe)
+        votes_writer.flush()
+        wardrobe_writer.flush()
+        frontier.mark_shelves_done(mid)
 
 
 async def _shelves_for_profile(
@@ -210,20 +326,12 @@ async def _shelves_for_profile(
     user: User,
     profile_url: str,
 ) -> ParsedShelves:
-    """Un POST extra por perfil. RateLimited/challenge se propagan al runner.
-
-    Un fallo de descifrado o de forma del JSON no tumba el perfil: las reviews
-    del HTML ya estan parseadas. El passphrase es `_pd(host)`, no el bundle.
-
-    Los votos vuelven como Interaction; el wardrobe como WardrobeItem. No se
-    mezclan: have/had/want no es una calificacion.
-    """
-    empty = ParsedShelves()
-    if not client.cfg.fetch_shelves or client._shelves_disabled:
-        return empty
+    """POST de wardrobe. RateLimited/challenge suben al loop de jobs."""
+    if not client.should_fetch_shelves():
+        raise FetchError("shelves pausados o deshabilitados")
     pw = await client.ensure_passphrase(html)
     if not pw:
-        return empty
+        raise FetchError("sin passphrase AES")
     try:
         result = await client.post(
             absolute("/ajax.php?user_shelves"),
@@ -231,18 +339,23 @@ async def _shelves_for_profile(
             referer=profile_url,
         )
         payload = unwrap_ajax_body(result.body, pw)
-    except RateLimited:
+    except RateLimited as exc:
+        client.pause_shelves(str(exc))
+        console.print(
+            f"[yellow]shelves en pausa {client.cfg.shelves_cooldown / 60:.0f} min[/yellow] "
+            f"(429 ajax; el HTML sigue). {exc}"
+        )
         raise
     except ChallengeDetected as exc:
         client.disable_shelves(str(exc))
-        return empty
+        raise
     except (DecryptError, FetchError, NotFound, ValueError) as exc:
         log.warning("shelves de @%s: %s", user.username_slug, exc)
         if isinstance(exc, DecryptError):
             client._shelves_decrypt_fails += 1
             if client._shelves_decrypt_fails >= 3:
                 client.disable_shelves("descifrado ajax fallo 3 veces seguidas")
-        return empty
+        raise FetchError(str(exc)) from exc
     client._shelves_decrypt_fails = 0
     return parse_shelves(payload, member_id=user.member_id, slug=user.username_slug)
 

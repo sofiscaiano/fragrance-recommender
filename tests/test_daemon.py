@@ -78,3 +78,11 @@ def test_seed_state_inherits_frontier_block(tmp_path: Path) -> None:
     assert seeded.last_reason == "challenge"
     assert seeded.last_block_at == ts
     fr.close()
+
+
+def test_next_phase_stays_on_3_when_only_shelves_remain(tmp_path: Path) -> None:
+    fr = Frontier(tmp_path / "f.db")
+    assert next_phase(fr) is None
+    fr.enqueue_shelves(1, "a", "https://www.fragrantica.com/@a")
+    assert next_phase(fr) == 3
+    fr.close()

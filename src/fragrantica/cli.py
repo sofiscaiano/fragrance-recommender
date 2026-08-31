@@ -27,6 +27,7 @@ from .pipeline.phases import (
     phase3_profiles,
     phase5_orphans,
     prune_slice,
+    enqueue_missing_shelves,
 )
 
 app = typer.Typer(add_completion=False, help="Scraper de Fragrantica para sistemas de recomendacion")
@@ -212,6 +213,15 @@ def status(data_dir: Path = typer.Option(DATA_DIR)) -> None:
         )
         for r in deferred[:5]:
             console.print(f"  {r['url']}\n    {r['last_error']}")
+
+    sh = frontier.shelves_stats()
+    if sh:
+        st = Table(title="Cola de wardrobe (shelves_jobs)")
+        st.add_column("status")
+        st.add_column("n", justify="right")
+        for s, n in sorted(sh.items()):
+            st.add_row(s, f"{n:,}")
+        console.print(st)
     frontier.close()
 
 
@@ -233,6 +243,22 @@ def requeue_profiles(
         f"{n} perfiles done/in_progress vueltos a pending (prioridad baja). "
         "Las reviews en staging se quedan; el wardrobe se pide en el proximo GET."
     )
+    frontier.close()
+
+
+@app.command("enqueue-shelves")
+def enqueue_shelves_cmd(
+    data_dir: Path = typer.Option(DATA_DIR),
+) -> None:
+    """Encola POST de wardrobe para perfiles con HTML y sin closet.
+
+    No vuelve a bajar el perfil. Quien ya tiene filas en staging/wardrobe
+    se saltea. Idempotente.
+    """
+    staging, _, db = _paths(data_dir)
+    frontier = Frontier(db)
+    n = enqueue_missing_shelves(frontier, staging)
+    console.print(f"{n} jobs de wardrobe encolados")
     frontier.close()
 
 
@@ -302,12 +328,17 @@ def daemon(
     """
     _setup(verbose)
     staging, _, db = _paths(data_dir)
+    if CRAWL.shelves_proxies:
+        console.print(
+            f"[cyan]{len(CRAWL.shelves_proxies)} proxy(s) de wardrobe "
+            "en FRAGRANTICA_SHELVES_PROXY[/cyan]"
+        )
     if CRAWL.proxies:
         console.print(f"[cyan]{len(CRAWL.proxies)} proxy(s) en FRAGRANTICA_PROXY[/cyan]")
     else:
         console.print(
-            "[dim]Sin proxy. Una IP hogarena termina el slice de Dior en dias; "
-            "el catalogo completo necesita FRAGRANTICA_PROXY residencial.[/dim]"
+            "[dim]Sin FRAGRANTICA_PROXY. HTML por IP hogarena. "
+            "Wardrobe: FRAGRANTICA_SHELVES_PROXY (opcional, residencial).[/dim]"
         )
 
     async def run() -> None:

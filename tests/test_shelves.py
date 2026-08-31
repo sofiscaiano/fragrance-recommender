@@ -1,6 +1,12 @@
 """Parser de wardrobe / votos a partir del JSON ya descifrado."""
 
+from fragrantica.config import CrawlConfig
+from fragrantica.http_client import Client, FetchError, RateLimited
+from fragrantica.models import User
 from fragrantica.parsers.shelves import parse_shelves
+from fragrantica.pipeline.phases import _shelves_for_profile
+
+import pytest
 
 
 def test_wardrobe_and_votes_from_named_keys():
@@ -116,3 +122,93 @@ def test_ajax_shelves_use_id_and_shelf_value():
     assert len(parsed.votes) == 1
     assert parsed.votes[0].source == "vote"
     assert parsed.votes[0].rating is None
+
+
+# -- politica de fetch: 429 de ajax no tumba el perfil ----------------------
+
+
+CFG_PAUSE = CrawlConfig(shelves_cooldown=3600.0)
+
+
+def _user() -> User:
+    return User(member_id=1, username_slug="u")
+
+
+def test_pause_shelves_blocks_then_expires() -> None:
+    client = Client(CFG_PAUSE)
+    assert client.should_fetch_shelves(now=1000.0) is True
+    client.pause_shelves("HTTP 429 en ajax", now=1000.0)
+    assert client.shelves_paused(now=1000.0)
+    assert client.should_fetch_shelves(now=1000.0) is False
+    assert client.should_fetch_shelves(now=1000.0 + 3599) is False
+    assert client.should_fetch_shelves(now=1000.0 + 3600) is True
+    assert client.shelves_paused(now=1000.0 + 3600) is False
+
+
+def test_disable_shelves_outlives_the_pause() -> None:
+    client = Client(CFG_PAUSE)
+    client.pause_shelves("429", now=1.0)
+    client.disable_shelves("403")
+    assert client.should_fetch_shelves(now=10_000.0) is False
+
+
+class _Ajax429(Client):
+    def __init__(self) -> None:
+        super().__init__(CFG_PAUSE)
+        self.posts = 0
+
+    async def post(self, url, *, data, worker=0, referer=None):
+        self.posts += 1
+        raise RateLimited(f"HTTP 429 en {url}")
+
+    async def ensure_passphrase(self, sample_html="", *, worker=0):
+        return "pw"
+
+
+async def test_ajax_429_raises_and_pauses() -> None:
+    client = _Ajax429()
+    user = _user()
+
+    with pytest.raises(RateLimited):
+        await _shelves_for_profile(
+            client, "<html>", user, "https://www.fragrantica.com/@u"
+        )
+    assert client.posts == 1
+    assert client.shelves_paused()
+
+    with pytest.raises(FetchError):
+        await _shelves_for_profile(
+            client, "<html>", user, "https://www.fragrantica.com/@u"
+        )
+    assert client.posts == 1
+
+
+def test_shelves_proxy_is_only_for_post_worker() -> None:
+    from fragrantica.http_client import SHELVES_WORKER
+
+    cfg = CrawlConfig(
+        shelves_proxies=("http://shelf.example:9",),
+        proxies=("http://home.example:8",),
+    )
+    client = Client(cfg)
+    assert client._proxy_for(SHELVES_WORKER) == "http://shelf.example:9"
+    assert client._proxy_for(0) == "http://home.example:8"
+
+
+def test_enqueue_missing_skips_who_already_has_wardrobe(tmp_path) -> None:
+    from fragrantica.frontier import Frontier
+    from fragrantica.models import WardrobeItem
+    from fragrantica.pipeline.phases import enqueue_missing_shelves
+    from fragrantica.storage import ParquetWriter
+
+    fr = Frontier(tmp_path / "f.db")
+    fr.record_member_id("has", 10)
+    fr.record_member_id("missing", 20)
+    w = ParquetWriter(tmp_path, "wardrobe")
+    w.add(WardrobeItem(member_id=10, username_slug="has", perfume_id=1, relation="have"))
+    w.flush()
+    n = enqueue_missing_shelves(fr, tmp_path)
+    assert n == 1
+    assert fr.claim_shelves(1)[0]["member_id"] == 20
+    assert enqueue_missing_shelves(fr, tmp_path) == 0
+    fr.close()

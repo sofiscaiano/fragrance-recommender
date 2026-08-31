@@ -23,6 +23,8 @@ from curl_cffi import requests as cffi
 from .config import BASE_URL, CRAWL, CrawlConfig
 
 PROBE_URL = f"{BASE_URL}/perfume/Dior/Sauvage-31861.html"
+# Sesion aparte del GET: sale por FRAGRANTICA_SHELVES_PROXY si esta definido.
+SHELVES_WORKER = -1
 
 log = logging.getLogger(__name__)
 
@@ -124,13 +126,23 @@ class Client:
         self._passphrase: str | None = None
         self._passphrase_failed = False
         self._shelves_disabled = False
+        self._shelves_paused_until = 0.0
         self._shelves_decrypt_fails = 0
+        # Sin proxy de shelves, GET y POST no se solapan: es la misma IP.
+        self._serial_io = asyncio.Lock()
 
     # -- gestion de sesiones ------------------------------------------------
 
+    def _proxy_for(self, worker: int) -> str | None:
+        if worker == SHELVES_WORKER and self.cfg.shelves_proxies:
+            return random.choice(self.cfg.shelves_proxies)
+        if self.cfg.proxies:
+            return random.choice(self.cfg.proxies)
+        return None
+
     def _new_session(self, worker: int) -> tuple[cffi.AsyncSession, int, str]:
         profile = random.choice(self.cfg.impersonate_profiles)
-        proxy = random.choice(self.cfg.proxies) if self.cfg.proxies else None
+        proxy = self._proxy_for(worker)
         session = cffi.AsyncSession(
             impersonate=profile,
             proxy=proxy,
@@ -147,7 +159,12 @@ class Client:
                 "Sec-Fetch-Site": "same-origin",
             },
         )
-        log.debug("worker %d: sesion nueva con perfil %s", worker, profile)
+        log.debug(
+            "worker %d: sesion nueva con perfil %s%s",
+            worker,
+            profile,
+            " (shelves proxy)" if worker == SHELVES_WORKER and self.cfg.shelves_proxies else "",
+        )
         return session, 0, profile
 
     async def _session_for(self, worker: int) -> cffi.AsyncSession:
@@ -230,15 +247,34 @@ class Client:
         url: str,
         *,
         data: dict[str, str],
-        worker: int = 0,
+        worker: int = SHELVES_WORKER,
         referer: str | None = None,
     ) -> FetchResult:
-        """POST form-urlencoded (ajax). Misma cortesia y circuit breaker que GET."""
+        """POST form-urlencoded (ajax). Sale por SHELVES_WORKER / proxy de shelves."""
         return await self._request(
             "POST", url, worker=worker, referer=referer, data=data, kind="json",
         )
 
     async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        worker: int,
+        referer: str | None,
+        kind: str,
+        data: dict[str, str] | None = None,
+    ) -> FetchResult:
+        if self.cfg.shelves_proxies:
+            return await self._request_unlocked(
+                method, url, worker=worker, referer=referer, kind=kind, data=data
+            )
+        async with self._serial_io:
+            return await self._request_unlocked(
+                method, url, worker=worker, referer=referer, kind=kind, data=data
+            )
+
+    async def _request_unlocked(
         self,
         method: str,
         url: str,
@@ -296,8 +332,12 @@ class Client:
                     retry_after = float(raw)
                 except ValueError:
                     retry_after = None
-            # Pausa global: el 429 habla de nuestro ritmo agregado.
-            self.pause_all(retry_after or self.cfg.rate_limit_pause, f"HTTP 429 en {url}")
+            # pause_all es para 429 de pagina (ritmo de IP). En ajax el cupo
+            # es del endpoint: frenar el HTML 5 min recreaba el 70/19.
+            if kind != "json":
+                self.pause_all(
+                    retry_after or self.cfg.rate_limit_pause, f"HTTP 429 en {url}"
+                )
             raise RateLimited(f"HTTP 429 en {url}", retry_after)
 
         if resp.status_code in (403, 503) or looks_like_challenge(body, kind=kind):
@@ -359,6 +399,39 @@ class Client:
         if not self._shelves_disabled:
             self._shelves_disabled = True
             log.warning("shelves deshabilitados: %s", reason)
+
+    def pause_shelves(self, reason: str, *, now: float | None = None) -> None:
+        """Pausa temporal de los POST tras un 429 de ajax.
+
+        El HTML del perfil sigue: ahi vive el member_id. Reanudar ajax a
+        los 15 min (cooldown del daemon) pedía ~19 perfiles con la ventana
+        llena y volvia a 429.
+        """
+        t = now if now is not None else time.time()
+        until = t + self.cfg.shelves_cooldown
+        if until > self._shelves_paused_until:
+            self._shelves_paused_until = until
+            log.warning(
+                "shelves en pausa %.0f min: %s",
+                self.cfg.shelves_cooldown / 60,
+                reason,
+            )
+
+    def shelves_paused(self, *, now: float | None = None) -> bool:
+        t = now if now is not None else time.time()
+        return t < self._shelves_paused_until
+
+    def should_fetch_shelves(self, *, now: float | None = None) -> bool:
+        """False si fetch_shelves esta apagado, 403 permanente, o pausa 429."""
+        if not self.cfg.fetch_shelves or self._shelves_disabled:
+            return False
+        t = now if now is not None else time.time()
+        if t < self._shelves_paused_until:
+            return False
+        if self._shelves_paused_until > 0:
+            log.info("shelves reanudados: vencio la pausa de ajax 429")
+            self._shelves_paused_until = 0.0
+        return True
 
     async def close(self) -> None:
         for session, _, _ in self._sessions.values():

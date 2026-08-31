@@ -86,6 +86,21 @@ def existing_ids(directory: Path, column: str) -> set[str]:
     return ids
 
 
+def existing_int_ids(directory: Path, column: str) -> set[int]:
+    """Igual que existing_ids pero para enteros (member_id del wardrobe)."""
+    files = list(directory.glob("*.parquet"))
+    if not files:
+        return set()
+    ids: set[int] = set()
+    for path in files:
+        table = pq.read_table(path, columns=[column])
+        for v in table[column].to_pylist():
+            if v is None:
+                continue
+            ids.add(int(v))
+    return ids
+
+
 def _flatten(row: dict[str, Any]) -> dict[str, Any]:
     """Serializa estructuras anidadas para que Parquet infiera un esquema estable.
 

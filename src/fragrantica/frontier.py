@@ -55,6 +55,23 @@ CREATE TABLE IF NOT EXISTS member_ids (
     username_slug TEXT PRIMARY KEY,
     member_id     INTEGER NOT NULL
 );
+
+-- POST de wardrobe, desacoplado del GET del perfil. El HTML se confirma
+-- done aunque el ajax 429-ee; este cuaderno sobrevive a Ctrl-C.
+CREATE TABLE IF NOT EXISTS shelves_jobs (
+    member_id     INTEGER PRIMARY KEY,
+    slug          TEXT NOT NULL,
+    profile_url   TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT,
+    next_retry_at INTEGER,
+    claimed_at    INTEGER,
+    updated_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_shelves_claimable
+    ON shelves_jobs(status, next_retry_at);
 """
 
 
@@ -127,7 +144,17 @@ class Frontier:
                 """,
                 (int(time.time()), cutoff),
             )
-        return cur.rowcount
+            n = cur.rowcount
+            cur = conn.execute(
+                """
+                UPDATE shelves_jobs
+                   SET status='pending', claimed_at=NULL, updated_at=?
+                 WHERE status='in_progress' AND (claimed_at IS NULL OR claimed_at < ?)
+                """,
+                (int(time.time()), cutoff),
+            )
+            n += cur.rowcount
+        return n
 
     # -- consumo ------------------------------------------------------------
 
@@ -232,6 +259,138 @@ class Frontier:
             r["username_slug"]: r["member_id"]
             for r in self.conn.execute("SELECT username_slug, member_id FROM member_ids")
         }
+
+    # -- shelves (wardrobe POST, cola aparte) -------------------------------
+
+    def enqueue_shelves(self, member_id: int, slug: str, profile_url: str) -> bool:
+        """Encola un POST de wardrobe. Idempotente: no pisa done/pending."""
+        now = int(time.time())
+        cur = self.conn.execute(
+            """
+            INSERT INTO shelves_jobs
+                (member_id, slug, profile_url, status, updated_at)
+            VALUES (?, ?, ?, 'pending', ?)
+            ON CONFLICT(member_id) DO NOTHING
+            """,
+            (int(member_id), slug.lower(), profile_url, now),
+        )
+        return cur.rowcount > 0
+
+    def enqueue_shelves_many(self, rows: list[tuple[int, str, str]]) -> int:
+        if not rows:
+            return 0
+        now = int(time.time())
+        before = self.conn.execute("SELECT count(*) FROM shelves_jobs").fetchone()[0]
+        self.conn.executemany(
+            """
+            INSERT INTO shelves_jobs
+                (member_id, slug, profile_url, status, updated_at)
+            VALUES (?, ?, ?, 'pending', ?)
+            ON CONFLICT(member_id) DO NOTHING
+            """,
+            [(int(mid), slug.lower(), url, now) for mid, slug, url in rows],
+        )
+        after = self.conn.execute("SELECT count(*) FROM shelves_jobs").fetchone()[0]
+        return after - before
+
+    def claim_shelves(self, n: int = 1) -> list[sqlite3.Row]:
+        now = int(time.time())
+        with self._tx() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM shelves_jobs
+                 WHERE status IN ('pending', 'failed')
+                   AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                 ORDER BY attempts ASC, updated_at ASC
+                 LIMIT ?
+                """,
+                (now, n),
+            ).fetchall()
+            if rows:
+                conn.executemany(
+                    """UPDATE shelves_jobs SET status='in_progress',
+                       claimed_at=?, updated_at=? WHERE member_id=?""",
+                    [(now, now, r["member_id"]) for r in rows],
+                )
+        return list(rows)
+
+    def mark_shelves_done(self, member_id: int) -> None:
+        self.conn.execute(
+            """UPDATE shelves_jobs SET status='done', claimed_at=NULL,
+               last_error=NULL, updated_at=? WHERE member_id=?""",
+            (int(time.time()), int(member_id)),
+        )
+
+    def requeue_shelves(self, member_id: int, error: str, delay: float) -> None:
+        """429 de ajax: no cuenta intento. El HTML del perfil ya es done."""
+        now = int(time.time())
+        self.conn.execute(
+            """UPDATE shelves_jobs SET status='pending', last_error=?,
+               claimed_at=NULL, next_retry_at=?, updated_at=? WHERE member_id=?""",
+            (error[:500], now + int(delay), now, int(member_id)),
+        )
+
+    def mark_shelves_failed(
+        self, member_id: int, error: str, max_attempts: int, backoff: float
+    ) -> Status:
+        now = int(time.time())
+        mid = int(member_id)
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT attempts FROM shelves_jobs WHERE member_id=?", (mid,)
+            ).fetchone()
+            attempts = (row["attempts"] if row else 0) + 1
+            if attempts >= max_attempts:
+                conn.execute(
+                    """UPDATE shelves_jobs SET status='dead', attempts=?, last_error=?,
+                       claimed_at=NULL, next_retry_at=NULL, updated_at=? WHERE member_id=?""",
+                    (attempts, error[:500], now, mid),
+                )
+                return "dead"
+            conn.execute(
+                """UPDATE shelves_jobs SET status='failed', attempts=?, last_error=?,
+                   claimed_at=NULL, next_retry_at=?, updated_at=? WHERE member_id=?""",
+                (attempts, error[:500], now + int(backoff), now, mid),
+            )
+        return "failed"
+
+    def shelves_stats(self) -> dict[str, int]:
+        return {
+            r["status"]: r["n"]
+            for r in self.conn.execute(
+                "SELECT status, count(*) AS n FROM shelves_jobs GROUP BY status"
+            )
+        }
+
+    def shelves_pending_count(self) -> int:
+        now = int(time.time())
+        return self.conn.execute(
+            """SELECT count(*) FROM shelves_jobs
+                WHERE status IN ('pending','failed')
+                  AND (next_retry_at IS NULL OR next_retry_at <= ?)""",
+            (now,),
+        ).fetchone()[0]
+
+    def shelves_waiting_count(self) -> int:
+        now = int(time.time())
+        return self.conn.execute(
+            """SELECT count(*) FROM shelves_jobs
+                WHERE status IN ('pending','failed')
+                  AND next_retry_at IS NOT NULL AND next_retry_at > ?""",
+            (now,),
+        ).fetchone()[0]
+
+    def shelves_in_flight_count(self) -> int:
+        return self.conn.execute(
+            "SELECT count(*) FROM shelves_jobs WHERE status='in_progress'"
+        ).fetchone()[0]
+
+    def shelves_has_work(self) -> bool:
+        return (
+            self.shelves_pending_count()
+            + self.shelves_waiting_count()
+            + self.shelves_in_flight_count()
+        ) > 0
 
     # -- observabilidad -----------------------------------------------------
 

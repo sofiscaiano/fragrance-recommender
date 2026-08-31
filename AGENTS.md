@@ -81,7 +81,8 @@ Comandos de higiene del frontier:
 ```bash
 .venv/bin/fragrantica reset-429          # pending+attempts=0 para 429/403/interstitial
 .venv/bin/fragrantica retry-dead         # dead-letters genéricos
-.venv/bin/fragrantica requeue-profiles   # perfiles already-done → pending (2º pase wardrobe)
+.venv/bin/fragrantica enqueue-shelves    # HTML ya done, sin closet → cola de POST
+.venv/bin/fragrantica requeue-profiles   # perfiles already-done → pending (2º pase GET)
 .venv/bin/fragrantica status
 ```
 
@@ -167,6 +168,16 @@ La fase 3 hace un POST extra por perfil. Si el descifrado falla, el perfil se
 guarda igual con las reviews del HTML. Un 403 en el ajax corta los POST del
 resto del proceso para no gastar 13k requests inútiles.
 
+Un **429 en `/ajax.php?user_shelves` no es bloqueo de IP**. El GET del perfil
+se confirma `done` y el POST va a `shelves_jobs` (cuaderno durable). Un worker
+aparte drena esa cola. Si hay `FRAGRANTICA_SHELVES_PROXY` (residencial, aparte
+de `FRAGRANTICA_PROXY`), el closet sale por esa IP y puede ir en paralelo al
+HTML hogareño. Sin ese env, GET y POST no se solapan: es la misma IP.
+
+Un 429 de ajax pausa solo el loop de shelves (~45 min). `StopCrawl` queda para
+429/interstitial de **página**. Los perfiles ya crawleados sin closet se
+encolan al arrancar la fase 3 o con `fragrantica enqueue-shelves`.
+
 Los **votos** entran a `interactions` con `source=vote` y `review_id` nulo
 (sí son una calificación). El **wardrobe** va a `staging/wardrobe/` y al
 export `wardrobe.parquet`: have/had/want no se mezcla con las reviews ni
@@ -223,9 +234,12 @@ Cuatro invariantes que **no hay que romper** al modificar el runner:
 2. **Los leases vencen.** `reclaim_stale()` devuelve a `pending` lo que quedó
    `in_progress` hace más de 15 min. Es lo que hace segura la recuperación de un
    `kill -9`.
-3. **El 429 corta el ciclo** (`requeue` + StopCrawl). Un interstitial hace
-   un canario (Sauvage, misma sesión): si pasa, la URL va a `deferred` (12 h)
-   y el lote sigue; si el canario también falla, StopCrawl como el 429.
+3. **El 429 de página corta el ciclo** (`requeue` + StopCrawl). Un 429 de
+   ajax `/user_shelves` no: el job vuelve a `shelves_jobs` y el HTML ya es
+   `done`. Con `FRAGRANTICA_SHELVES_PROXY` el POST no comparte IP con el GET.
+   Un interstitial hace un canario (Sauvage, misma sesión): si pasa, la URL
+   va a `deferred` (12 h) y el lote sigue; si el canario también falla,
+   StopCrawl como el 429 de página.
 4. **La condición de salida mira `waiting_count()`, no solo `pending_count()`.**
    `pending_count` solo cuenta lo elegible *ya*; sin `waiting_count` el runner
    abandonaría los items diferidos por backoff. (Este bug existió y está
