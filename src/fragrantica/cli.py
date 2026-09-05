@@ -20,7 +20,7 @@ from .frontier import Frontier
 from .http_client import Client, probe_site
 from .pipeline.consolidate import consolidate
 from .pipeline.daemon import run_daemon
-from .pipeline.runner import StopCrawl
+from .pipeline.runner import StopCrawl, queue_progress
 from .pipeline.phases import (
     phase1_enumerate,
     phase2_perfumes,
@@ -28,6 +28,7 @@ from .pipeline.phases import (
     phase5_orphans,
     prune_slice,
     enqueue_missing_shelves,
+    shelves_progress,
 )
 
 app = typer.Typer(add_completion=False, help="Scraper de Fragrantica para sistemas de recomendacion")
@@ -114,7 +115,7 @@ def _orphan_urls(staging: Path, orphan_ids: list[int]) -> dict[int, str]:
     src = staging / "item_frontier" / "*.parquet"
     try:
         rows = duckdb.sql(
-            f"SELECT perfume_id, url FROM read_parquet('{src}')"
+            f"SELECT perfume_id, url FROM read_parquet('{src}', union_by_name=true)"
         ).fetchall()
     except Exception:
         return {}
@@ -177,6 +178,18 @@ def status(data_dir: Path = typer.Option(DATA_DIR)) -> None:
         return
 
     kinds = sorted({k for k, _ in stats})
+    _, _, html_desc = queue_progress(frontier, "profile", "perfiles HTML")
+
+    class _StatusShelves:
+        _shelves_disabled = False
+
+        def shelves_paused(self, *, now: float | None = None) -> bool:
+            return False
+
+    _, _, sh_desc = shelves_progress(frontier, _StatusShelves())
+    console.print(f"[bold]{html_desc}[/bold]")
+    console.print(f"[bold]{sh_desc}[/bold]\n")
+
     statuses = ["pending", "in_progress", "done", "failed", "skipped", "dead", "deferred"]
     t = Table(title="Estado del frontier")
     t.add_column("kind")
@@ -222,6 +235,12 @@ def status(data_dir: Path = typer.Option(DATA_DIR)) -> None:
         for s, n in sorted(sh.items()):
             st.add_row(s, f"{n:,}")
         console.print(st)
+        waiting = frontier.shelves_waiting_count()
+        claimable = frontier.shelves_pending_count()
+        console.print(
+            f"[dim]wardrobe reclamables ahora: {claimable:,} · "
+            f"en backoff (429/error): {waiting:,}[/dim]"
+        )
     frontier.close()
 
 
@@ -320,11 +339,12 @@ def daemon(
     data_dir: Path = typer.Option(DATA_DIR),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Crawl continuo: fase 2, luego 3. No se apaga en el primer 429.
+    """Crawl continuo: fase 1 (marcas), 2 y 3. No se apaga en el primer 429.
 
     Si Cloudflare corta, espera (30 min, 1 h, 2 h, tope 6 h), hace UN probe
-    y reanuda. Ritmo 10-20 s entre requests. Ctrl-C para parar; el frontier
-    queda reanudable.
+    y reanuda. Un worker, delay del config. Ctrl-C para parar; el frontier
+    queda reanudable. Con el slice Dior ya done, el primer ciclo pide el
+    indice A-Z y encola el resto del catalogo.
     """
     _setup(verbose)
     staging, _, db = _paths(data_dir)

@@ -1,8 +1,8 @@
 """Watchdog: crawl continuo que no martillea cuando Cloudflare corta.
 
-Un `phase 2` one-shot se apaga en el primer interstitial y deja el trabajo
-a medias. Este loop es lo que permite terminar el slice (y mas adelante el
-catalogo) sin sentarse a esperar el probe a mano:
+Un `phase` one-shot se apaga en el primer interstitial y deja el trabajo
+a medias. Este loop cubre fase 1 (indice A-Z + listados de marca), 2 y 3
+sin sentarse a esperar el probe a mano:
 
     trabajo -> StopCrawl -> espera exponencial -> UN probe -> si 200, sigue
 
@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -25,13 +26,16 @@ from rich.console import Console
 from ..config import CRAWL, CrawlConfig
 from ..frontier import Frontier, Kind
 from ..http_client import Client, probe_site
-from .phases import phase2_perfumes, phase3_profiles
+from .phases import phase1_enumerate, phase2_perfumes, phase3_profiles
 from .runner import StopCrawl
 
 log = logging.getLogger(__name__)
 console = Console()
 
-_PHASES: tuple[tuple[Kind, int], ...] = (("perfume", 2), ("profile", 3))
+_PHASES: tuple[tuple[Kind, int], ...] = (("designer", 1), ("perfume", 2), ("profile", 3))
+
+# remaining seconds, "wait" | "probe". Lo usa la barra de perfiles HTML.
+WaitTick = Callable[[float, str], None]
 
 
 @dataclass
@@ -55,12 +59,19 @@ def reason_from_error(message: str) -> str:
     return "429" if "429" in message else "challenge"
 
 
-def next_phase(frontier: Frontier) -> int | None:
-    """2 si hay perfume reclamable ahora, 3 si solo perfiles, None si no hay red.
+def next_phase(frontier: Frontier, *, seed_catalog: bool = False) -> int | None:
+    """1 marcas, 2 perfume, 3 perfiles. None si no hay red.
+
+    `seed_catalog=True` fuerza la fase 1 aunque las colas esten vacias: hay
+    que pedir el indice A-Z (add_many es idempotente; Dior already-done no
+    se vuelve a bajar). Sin eso el daemon se iria a dormir con el slice
+    cerrado y nunca enumeraria el resto del sitio.
 
     Las URLs `deferred` (cuarentena) con backoff a futuro no bloquean el
-    salto a fase 3: pending_count solo las cuenta cuando ya vencio.
+    salto a la fase siguiente: pending_count solo las cuenta cuando ya vencio.
     """
+    if seed_catalog:
+        return 1
     for kind, phase in _PHASES:
         n = (
             frontier.pending_count(kind)
@@ -141,22 +152,37 @@ def seed_state_from_frontier(state: DaemonState, frontier: Frontier) -> DaemonSt
     return state
 
 
-async def sleep_countdown(seconds: float) -> None:
+def format_cooldown_left(seconds: float) -> str:
+    """Texto corto para la barra: '12.3 min' o '8 s'."""
+    if seconds >= 60:
+        return f"{seconds / 60:.1f} min"
+    return f"{max(0.0, seconds):.0f} s"
+
+
+async def sleep_countdown(
+    seconds: float,
+    on_tick: WaitTick | None = None,
+) -> None:
     """Duerme en tramos para que Ctrl-C no espere el cooldown entero."""
     end = time.time() + seconds
     while True:
         left = end - time.time()
         if left <= 0:
             return
-        mins = left / 60
-        console.print(f"[dim]proxima probe en {mins:.1f} min[/dim]")
-        await asyncio.sleep(min(300.0, left))
+        if on_tick is not None:
+            on_tick(left, "wait")
+            await asyncio.sleep(min(2.0, left))
+        else:
+            console.print(f"[dim]proxima probe en {left / 60:.1f} min[/dim]")
+            await asyncio.sleep(min(300.0, left))
 
 
 async def wait_until_clear(
     state: DaemonState,
     state_path: Path,
     cfg: CrawlConfig = CRAWL,
+    *,
+    on_tick: WaitTick | None = None,
 ) -> DaemonState:
     """Espera el cooldown, un probe; si sigue bloqueado, dobla y repite."""
     while True:
@@ -164,13 +190,19 @@ async def wait_until_clear(
             state.last_block_at, state.last_reason, state.consecutive_blocks, cfg=cfg
         )
         if wait > 0:
-            console.print(
-                f"[yellow]Cooldown {state.last_reason}: "
-                f"{wait / 60:.1f} min (#{state.consecutive_blocks + 1})[/yellow]"
-            )
-            await sleep_countdown(wait)
+            if on_tick is not None:
+                on_tick(wait, "wait")
+            else:
+                console.print(
+                    f"[yellow]Cooldown {state.last_reason}: "
+                    f"{wait / 60:.1f} min (#{state.consecutive_blocks + 1})[/yellow]"
+                )
+            await sleep_countdown(wait, on_tick=on_tick)
 
-        console.print("[bold]probe[/bold]: un request para ver si se puede reanudar")
+        if on_tick is not None:
+            on_tick(0.0, "probe")
+        else:
+            console.print("[bold]probe[/bold]: un request para ver si se puede reanudar")
         result = await asyncio.to_thread(probe_site, cfg)
         if result.ok:
             console.print(
@@ -201,7 +233,7 @@ async def run_daemon(
     state_path: Path,
     cfg: CrawlConfig = CRAWL,
 ) -> None:
-    """Fase 2 y despues 3, hasta vaciar las colas o hasta Ctrl-C."""
+    """Fase 1 (indice + marcas), 2 y 3, hasta vaciar las colas o Ctrl-C."""
     state = seed_state_from_frontier(load_state(state_path), frontier)
     save_state(state_path, state)
 
@@ -210,12 +242,16 @@ async def run_daemon(
         # despues de un interstitial es lo que quemo la IP.
         state = await wait_until_clear(state, state_path, cfg)
 
+    # Un fetch del indice A-Z por proceso. Tras eso, solo se drena lo pending.
+    catalog_seeded = False
+
     while True:
-        phase = next_phase(frontier)
+        phase = next_phase(frontier, seed_catalog=not catalog_seeded)
         if phase is None:
             console.print(
-                "[bold green]Colas de perfume, perfil y shelves vacias.[/bold green] "
-                "Siguiente: [bold]fragrantica phase 6[/bold] (local, sin red)."
+                "[bold green]Colas de marca, perfume, perfil y shelves vacias.[/bold green] "
+                "Siguiente: [bold]fragrantica phase 5[/bold] y "
+                "[bold]fragrantica phase 6[/bold] (6 es local)."
             )
             return
 
@@ -225,10 +261,15 @@ async def run_daemon(
         )
         try:
             async with Client(cfg) as client:
-                if phase == 2:
+                if phase == 1:
+                    await phase1_enumerate(frontier, client, staging)
+                    catalog_seeded = True
+                elif phase == 2:
                     await phase2_perfumes(frontier, client, staging)
                 else:
-                    await phase3_profiles(frontier, client, staging)
+                    await phase3_profiles(
+                        frontier, client, staging, state_path=state_path
+                    )
         except StopCrawl as exc:
             # El ciclo llego a pedir paginas: el bloqueo es fresco. El primer
             # escalon (30 min / 15 min) alcanza; consecutive sube solo si el

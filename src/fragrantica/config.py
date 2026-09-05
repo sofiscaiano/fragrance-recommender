@@ -40,7 +40,7 @@ class CrawlConfig:
 
     # Jitter uniforme por worker. Un delay fijo es en si mismo una firma de bot,
     # mas detectable que ir un poco mas rapido de forma irregular.
-    delay_min: float = field(default_factory=lambda: _env_float("FRAGRANTICA_DELAY_MIN", 5))
+    delay_min: float = field(default_factory=lambda: _env_float("FRAGRANTICA_DELAY_MIN", 7))
     delay_max: float = field(default_factory=lambda: _env_float("FRAGRANTICA_DELAY_MAX", 10))
 
     timeout: float = 45.0
@@ -74,7 +74,7 @@ class CrawlConfig:
     # El daemon no pega contra el interstitial: espera, un probe, y reanuda.
     # 429 pide menos espera que un challenge de IP; ambos crecen en
     # exponencial hasta cooldown_cap (el martilleo corto es lo que escala a 403).
-    cooldown_429: float = field(default_factory=lambda: _env_float("FRAGRANTICA_COOLDOWN_429", 900.0))
+    cooldown_429: float = field(default_factory=lambda: _env_float("FRAGRANTICA_COOLDOWN_429", 300.0))
     cooldown_challenge: float = field(
         default_factory=lambda: _env_float("FRAGRANTICA_COOLDOWN_CHALLENGE", 1800.0)
     )
@@ -107,7 +107,7 @@ class CrawlConfig:
     # la ventana de Cloudflare y el burst corto pide con el cupo caliente.
     # 45 min deja caer el burst de 70; el HTML sigue recolectando member_id.
     shelves_cooldown: float = field(
-        default_factory=lambda: _env_float("FRAGRANTICA_SHELVES_COOLDOWN", 2700.0)
+        default_factory=lambda: _env_float("FRAGRANTICA_SHELVES_COOLDOWN", 60.0)
     )
 
 
@@ -129,10 +129,9 @@ class DatasetConfig:
     # Cortes adicionales para el reporte de sensibilidad al umbral.
     sensitivity_k_values: tuple[int, ...] = (3, 5, 10)
 
-    # Salt para hashear usernames en el export publico.
-    username_salt: str = field(
-        default_factory=lambda: os.environ.get("FRAGRANTICA_SALT", "cambiar-en-produccion")
-    )
+    # Salt para hashear usernames en el export publico. Fijo aca: no se
+    # lee de FRAGRANTICA_SALT. Si cambia, hay que reconsolidar (fase 6).
+    username_salt: str = "fragantica"
 
 
 # Cantidad de reviews que el sitio renderiza para un visitante anonimo. Si una

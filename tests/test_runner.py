@@ -196,3 +196,101 @@ async def test_ajax_429_does_not_stop_profile_phase(tmp_path: Path) -> None:
     # backfill no duplica
     assert enqueue_missing_shelves(fr, tmp_path) == 0
     fr.close()
+
+
+@pytest.mark.asyncio
+async def test_phase3_html_429_cools_down_without_killing_shelves(tmp_path: Path) -> None:
+    """Un 429 de GET no corta los POST: cooldown de esa tarea y reanuda."""
+    import asyncio
+
+    from fragrantica.config import CrawlConfig
+    from fragrantica.http_client import FetchResult
+    from fragrantica.parsers.shelves import ParsedShelves
+    from fragrantica.pipeline.phases import phase3_profiles
+    from fragrantica.pipeline.runner import StopCrawl
+
+    html = (Path(__file__).parent / "fixtures" / "profile_quilter.html").read_text()
+    shelves_during_html_wait: list[int] = []
+    html_in_cooldown = asyncio.Event()
+
+    class _Client:
+        def __init__(self) -> None:
+            self.cfg = CrawlConfig(
+                fetch_shelves=True,
+                delay_min=0,
+                delay_max=0,
+                rate_limit_pause=0,
+            )
+            self.gets = 0
+            self._shelves_disabled = False
+
+        async def fetch(self, url: str, *, worker: int = 0, referer=None, kind="html"):
+            self.gets += 1
+            if self.gets == 1:
+                raise RateLimited(f"HTTP 429 en {url}", retry_after=0.1)
+            return FetchResult(url=url, status=200, body=html, elapsed=0.0)
+
+        def shelves_paused(self, *, now: float | None = None) -> bool:
+            return False
+
+        def shelves_pause_remaining(self, *, now: float | None = None) -> float:
+            return 0.0
+
+        def should_fetch_shelves(self, *, now: float | None = None) -> bool:
+            return True
+
+    async def cooldown(exc: StopCrawl, state_path: Path, cfg) -> None:
+        assert exc.reason == "429"
+        html_in_cooldown.set()
+        await asyncio.sleep(0)
+
+    async def fake_shelves(client, sample_html, user, profile_url):
+        await html_in_cooldown.wait()
+        shelves_during_html_wait.append(user.member_id)
+        return ParsedShelves()
+
+    import fragrantica.pipeline.phases as phases
+
+    orig = phases._shelves_for_profile
+    phases._shelves_for_profile = fake_shelves  # type: ignore[assignment]
+    fr = Frontier(tmp_path / "f.db")
+    fr.add("https://www.fragrantica.com/@quilter", "profile", "quilter")
+    fr.enqueue_shelves(99, "other", "https://www.fragrantica.com/@other")
+    client = _Client()
+    try:
+        await phase3_profiles(
+            fr,
+            client,  # type: ignore[arg-type]
+            tmp_path,
+            state_path=tmp_path / "daemon_state.json",
+            html_cooldown=cooldown,
+        )
+        assert client.gets >= 2
+        assert html_in_cooldown.is_set()
+        assert 99 in shelves_during_html_wait
+        row = fr.conn.execute(
+            "SELECT status FROM frontier WHERE entity_id='quilter'"
+        ).fetchone()
+        assert row["status"] == "done"
+        assert fr.conn.execute(
+            "SELECT status FROM shelves_jobs WHERE member_id=99"
+        ).fetchone()["status"] == "done"
+    finally:
+        phases._shelves_for_profile = orig
+        fr.close()
+
+
+def test_queue_progress_uses_frontier_totals(tmp_path: Path) -> None:
+    from fragrantica.pipeline.runner import queue_progress
+
+    fr = Frontier(tmp_path / "f.db")
+    fr.add("https://x/1", "profile", "1")
+    fr.add("https://x/2", "profile", "2")
+    fr.mark_done("https://x/1")
+    done, total, desc = queue_progress(fr, "profile", "perfiles HTML")
+    assert done == 1
+    assert total == 2
+    assert "perfiles HTML" in desc
+    assert "1 done" in desc
+    assert "1 en cola" in desc
+    fr.close()

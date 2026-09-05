@@ -14,11 +14,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
 
-Configurar el salt de pseudonimización antes de correr en serio:
-
-```bash
-export FRAGRANTICA_SALT="algo-secreto-y-estable"
-```
+El salt de pseudonimización está en `DatasetConfig.username_salt` (`src/fragrantica/config.py`). No se lee del entorno.
 
 ## Uso
 
@@ -42,7 +38,7 @@ Todas son reanudables: reejecutar el mismo comando retoma donde quedó.
 .venv/bin/fragrantica phase 2                    # páginas de perfume
 .venv/bin/fragrantica phase 2 --limit 50         # acotado, para calibrar
 .venv/bin/fragrantica phase 3                    # perfiles de usuario
-.venv/bin/fragrantica daemon                     # 2 y 3, continuo (preferido)
+.venv/bin/fragrantica daemon                     # 1 → 2 → 3, continuo (preferido)
 .venv/bin/fragrantica phase 5                    # backfill de items huérfanos
 .venv/bin/fragrantica phase 6                    # consolidar y exportar
 ```
@@ -50,7 +46,7 @@ Todas son reanudables: reejecutar el mismo comando retoma donde quedó.
 ### Monitoreo
 
 ```bash
-.venv/bin/fragrantica daemon      # fase 2 → 3, no se apaga en el 429
+.venv/bin/fragrantica daemon      # fase 1 → 2 → 3, no se apaga en el 429
 .venv/bin/fragrantica status      # estado del frontier
 .venv/bin/fragrantica probe       # un request: ¿ya se levantó el bloqueo?
 .venv/bin/fragrantica reset-429   # rehabilitar URLs caídas por 429/403

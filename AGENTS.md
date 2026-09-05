@@ -234,12 +234,14 @@ Cuatro invariantes que **no hay que romper** al modificar el runner:
 2. **Los leases vencen.** `reclaim_stale()` devuelve a `pending` lo que quedó
    `in_progress` hace más de 15 min. Es lo que hace segura la recuperación de un
    `kill -9`.
-3. **El 429 de página corta el ciclo** (`requeue` + StopCrawl). Un 429 de
-   ajax `/user_shelves` no: el job vuelve a `shelves_jobs` y el HTML ya es
-   `done`. Con `FRAGRANTICA_SHELVES_PROXY` el POST no comparte IP con el GET.
-   Un interstitial hace un canario (Sauvage, misma sesión): si pasa, la URL
-   va a `deferred` (12 h) y el lote sigue; si el canario también falla,
-   StopCrawl como el 429 de página.
+3. **El 429 de página en fase 2 corta el ciclo** (`requeue` + StopCrawl). En
+   fase 3 el GET de perfil hace cooldown de *esa* tarea (espera + probe) y
+   reanuda; el loop de shelves no se corta. Un 429 de ajax `/user_shelves`
+   tampoco: el job vuelve a `shelves_jobs` y el HTML ya es `done`. Con
+   `FRAGRANTICA_SHELVES_PROXY` el POST no comparte IP con el GET. Un
+   interstitial hace un canario (Sauvage, misma sesión): si pasa, la URL
+   va a `deferred` (12 h) y el lote sigue; si el canario también falla, el
+   GET entra en el mismo cooldown (fase 3) o StopCrawl (fase 2).
 4. **La condición de salida mira `waiting_count()`, no solo `pending_count()`.**
    `pending_count` solo cuenta lo elegible *ya*; sin `waiting_count` el runner
    abandonaría los items diferidos por backoff. (Este bug existió y está
@@ -249,11 +251,10 @@ Cuatro invariantes que **no hay que romper** al modificar el runner:
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
-export FRAGRANTICA_SALT="algo-secreto-y-estable"
 
 .venv/bin/python -m pytest tests/ -q        # tests, ~1s, sin red
 .venv/bin/fragrantica status
-.venv/bin/fragrantica daemon                # fase 2 y 3, continuo
+.venv/bin/fragrantica daemon                # fase 1 → 2 → 3, continuo
 ```
 
 Los tests **no tocan la red**: corren contra HTML congelado en

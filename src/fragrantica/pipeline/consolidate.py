@@ -50,6 +50,17 @@ def _glob(staging: Path, name: str) -> str | None:
     return str(d / "*.parquet")
 
 
+def _read(src: str) -> str:
+    """Lee un glob de parts.
+
+    Cada flush de ParquetWriter infiere el esquema del batch. Un part donde
+    `signature_perfume_id` (u otra columna opcional) es todo-null queda tipado
+    como NULL; el siguiente, con un entero, como BIGINT. Sin union_by_name
+    DuckDB toma el primer archivo y el resto explota al castear.
+    """
+    return f"read_parquet('{src}', union_by_name=true)"
+
+
 def consolidate(
     staging: Path,
     final: Path,
@@ -69,7 +80,7 @@ def consolidate(
     if not sources:
         raise RuntimeError("no hay interacciones en staging; corre las fases 2 y 3 primero")
 
-    union = " UNION ALL BY NAME ".join(f"SELECT * FROM read_parquet('{s}')" for s in sources)
+    union = " UNION ALL BY NAME ".join(f"SELECT * FROM {_read(s)}" for s in sources)
     con.execute(f"CREATE TABLE raw_inter AS {union}")
     rep.interactions_raw = con.execute("SELECT count(*) FROM raw_inter").fetchone()[0]
 
@@ -131,7 +142,7 @@ def consolidate(
             SELECT * EXCLUDE (rn) FROM (
                 SELECT *, row_number() OVER (
                     PARTITION BY perfume_id ORDER BY reviews_scraped DESC
-                ) AS rn FROM read_parquet('{items_src}')
+                ) AS rn FROM {_read(items_src)}
             ) WHERE rn = 1
             """
         )
@@ -146,7 +157,7 @@ def consolidate(
             SELECT * EXCLUDE (rn) FROM (
                 SELECT *, row_number() OVER (
                     PARTITION BY member_id ORDER BY n_reviews_scraped DESC
-                ) AS rn FROM read_parquet('{users_src}')
+                ) AS rn FROM {_read(users_src)}
             ) WHERE rn = 1
             """
         )
@@ -170,7 +181,7 @@ def consolidate(
     # al umbral de reviews.
     wardrobe_src = _glob(staging, "wardrobe")
     if wardrobe_src:
-        con.execute(f"CREATE TABLE wardrobe_raw AS SELECT * FROM read_parquet('{wardrobe_src}')")
+        con.execute(f"CREATE TABLE wardrobe_raw AS SELECT * FROM {_read(wardrobe_src)}")
         con.execute(
             """
             CREATE TABLE wardrobe_resolved AS

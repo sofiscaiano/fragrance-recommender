@@ -139,6 +139,7 @@ def test_pause_shelves_blocks_then_expires() -> None:
     assert client.should_fetch_shelves(now=1000.0) is True
     client.pause_shelves("HTTP 429 en ajax", now=1000.0)
     assert client.shelves_paused(now=1000.0)
+    assert client.shelves_pause_remaining(now=1000.0) == 3600.0
     assert client.should_fetch_shelves(now=1000.0) is False
     assert client.should_fetch_shelves(now=1000.0 + 3599) is False
     assert client.should_fetch_shelves(now=1000.0 + 3600) is True
@@ -183,6 +184,25 @@ async def test_ajax_429_raises_and_pauses() -> None:
     assert client.posts == 1
 
 
+@pytest.mark.asyncio
+async def test_html_pause_all_does_not_block_shelves_proxy() -> None:
+    import time
+
+    from fragrantica.http_client import SHELVES_WORKER
+
+    cfg = CrawlConfig(
+        shelves_proxies=("http://shelf.example:9",),
+        delay_min=0,
+        delay_max=0,
+    )
+    client = Client(cfg)
+    client.pause_all(3600, "HTTP 429 de pagina")
+    t0 = time.monotonic()
+    await client._respect_breaker(worker=SHELVES_WORKER)
+    assert time.monotonic() - t0 < 1.0
+    assert client._paused_until > time.time()
+
+
 def test_shelves_proxy_is_only_for_post_worker() -> None:
     from fragrantica.http_client import SHELVES_WORKER
 
@@ -211,4 +231,42 @@ def test_enqueue_missing_skips_who_already_has_wardrobe(tmp_path) -> None:
     assert n == 1
     assert fr.claim_shelves(1)[0]["member_id"] == 20
     assert enqueue_missing_shelves(fr, tmp_path) == 0
+    fr.close()
+
+
+def test_shelves_progress_separates_done_from_queue(tmp_path) -> None:
+    from fragrantica.frontier import Frontier
+    from fragrantica.pipeline.phases import shelves_progress
+
+    class _Idle:
+        _shelves_disabled = False
+
+        def shelves_paused(self, *, now=None) -> bool:
+            return False
+
+        def shelves_pause_remaining(self, *, now=None) -> float:
+            return 0.0
+
+    class _Paused(_Idle):
+        def shelves_paused(self, *, now=None) -> bool:
+            return True
+
+        def shelves_pause_remaining(self, *, now=None) -> float:
+            return 720.0
+
+    fr = Frontier(tmp_path / "f.db")
+    fr.enqueue_shelves(1, "a", "https://www.fragrantica.com/@a")
+    fr.enqueue_shelves(2, "b", "https://www.fragrantica.com/@b")
+    fr.mark_shelves_done(1)
+    done, total, desc = shelves_progress(fr, _Idle())
+    assert done == 1
+    assert total == 2
+    assert "wardrobe POST" in desc
+    assert "1 done" in desc
+    assert "1 en cola" in desc
+    _, _, paused = shelves_progress(fr, _Paused())
+    assert "pausa 429" in paused
+    assert "12 min" in paused
+    _, _, inflight = shelves_progress(fr, _Idle(), current_slug="alice")
+    assert "POST @alice" in inflight
     fr.close()

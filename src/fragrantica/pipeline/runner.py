@@ -16,14 +16,17 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 from rich.console import Console
+
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
     Progress,
     SpinnerColumn,
+    TaskID,
     TextColumn,
     TimeElapsedColumn,
 )
@@ -89,6 +92,33 @@ Handler = Callable[[str, str, str], Awaitable[dict[str, list]] | dict[str, list]
 Precheck = Callable[[str, str], None]
 
 
+def queue_progress(frontier: Frontier, kind: Kind, name: str) -> tuple[int, int, str]:
+    """done, total y texto para la barra: cuenta el frontier, no solo esta corrida."""
+    st = frontier.stats(kind)
+    done = st.get((kind, "done"), 0)
+    queued = (
+        frontier.pending_count(kind)
+        + frontier.waiting_count(kind)
+        + frontier.in_flight_count(kind)
+    )
+    waiting = frontier.waiting_count(kind)
+    desc = f"{name}  {done:,} done · {queued:,} en cola"
+    if waiting:
+        desc += f"  ({waiting} backoff)"
+    return done, done + queued, desc
+
+
+def _refresh_queue_task(
+    progress: Progress,
+    task_id: TaskID,
+    frontier: Frontier,
+    kind: Kind,
+    name: str,
+) -> None:
+    done, total, desc = queue_progress(frontier, kind, name)
+    progress.update(task_id, completed=done, total=max(total, 1), description=desc)
+
+
 async def run_phase(
     *,
     name: str,
@@ -100,8 +130,14 @@ async def run_phase(
     cfg: CrawlConfig = CRAWL,
     limit: int | None = None,
     precheck: Precheck | None = None,
+    progress: Progress | None = None,
+    task_id: TaskID | None = None,
 ) -> RunStats:
-    """Consume el frontier de un `kind` hasta agotarlo."""
+    """Consume el frontier de un `kind` hasta agotarlo.
+
+    Si `progress`/`task_id` vienen de afuera (fase 3: perfiles + wardrobe
+    en el mismo live display), no se abre otra barra.
+    """
 
     reclaimed = frontier.reclaim_stale(cfg.lease_timeout_seconds)
     if reclaimed:
@@ -226,15 +262,29 @@ async def run_phase(
         finally:
             processed += 1
 
-    with Progress(
+    own_progress = progress is None
+    live = progress or Progress(
         SpinnerColumn(),
         TextColumn("[bold blue]{task.description}"),
         BarColumn(),
         MofNCompleteColumn(),
         TimeElapsedColumn(),
         console=console,
-    ) as progress:
-        task = progress.add_task(name, total=total_hint if limit is None else min(total_hint, limit))
+    )
+    ctx = live if own_progress else nullcontext(live)
+
+    with ctx:
+        task = (
+            live.add_task(
+                name,
+                total=total_hint if limit is None else min(total_hint, limit) or 1,
+            )
+            if own_progress
+            else task_id
+        )
+        if task is None:
+            raise RuntimeError("run_phase: task_id es obligatorio si se pasa progress")
+        _refresh_queue_task(live, task, frontier, kind, name)
 
         while True:
             if limit is not None and processed >= limit:
@@ -253,24 +303,21 @@ async def run_phase(
                 if waiting:
                     eta = frontier.next_retry_eta(kind)
                     sleep_for = max(2.0, min(60.0, (eta or 0) - time.time())) if eta else 2.0
-                    progress.update(
-                        task,
-                        description=f"{name} [dim](esperando backoff: {waiting} en cola)[/dim]",
-                    )
+                    _refresh_queue_task(live, task, frontier, kind, name)
                     await asyncio.sleep(sleep_for)
                 else:
                     await asyncio.sleep(2.0)
                 continue
 
-            progress.update(task, description=name)
-
             await asyncio.gather(
                 *(handle_one(row, i) for i, row in enumerate(rows)), return_exceptions=False
             )
             await flush_and_ack()
-            progress.update(task, completed=processed)
+            _refresh_queue_task(live, task, frontier, kind, name)
             if halt is not None:
                 break
+
+        _refresh_queue_task(live, task, frontier, kind, name)
 
     await flush_and_ack()
 

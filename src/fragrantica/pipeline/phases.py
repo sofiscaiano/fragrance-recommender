@@ -4,11 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+)
 
-from ..config import BASE_URL, CRAWL, DATASET, DatasetConfig
+from ..config import BASE_URL, CRAWL, DATA_DIR, DATASET, CrawlConfig, DatasetConfig
 from ..frontier import Frontier, backoff_delay
 from ..http_client import ChallengeDetected, Client, FetchError, NotFound, RateLimited, absolute
 from ..models import User
@@ -23,10 +35,61 @@ from ..parsers.perfume import parse_perfume
 from ..parsers.profile import member_id_from_avatar, parse_profile
 from ..parsers.shelves import ParsedShelves, parse_shelves
 from ..storage import ParquetWriter, existing_ids, existing_int_ids
-from .runner import AlreadyHave, SkipItem, run_phase
+from .runner import AlreadyHave, SkipItem, StopCrawl, queue_progress, run_phase
 
 log = logging.getLogger(__name__)
 console = Console()
+
+_HTML_PROGRESS_NAME = "perfiles HTML"
+_SHELVES_PROGRESS_NAME = "wardrobe POST"
+
+
+def shelves_progress(
+    frontier: Frontier,
+    client: Any,
+    *,
+    now: float | None = None,
+    current_slug: str | None = None,
+) -> tuple[int, int, str]:
+    """done, total y texto de la barra de closet, aparte del GET de perfil."""
+    sh = frontier.shelves_stats()
+    done = int(sh.get("done", 0))
+    queued = (
+        frontier.shelves_pending_count()
+        + frontier.shelves_waiting_count()
+        + frontier.shelves_in_flight_count()
+    )
+    waiting = frontier.shelves_waiting_count()
+    desc = f"{_SHELVES_PROGRESS_NAME}  {done:,} done · {queued:,} en cola"
+    if getattr(client, "_shelves_disabled", False):
+        desc = f"{_SHELVES_PROGRESS_NAME}  deshabilitado  ({done:,} done · {queued:,} en cola)"
+    elif client.shelves_paused(now=now):
+        remaining = client.shelves_pause_remaining(now=now) if hasattr(client, "shelves_pause_remaining") else 0.0
+        desc = (
+            f"{_SHELVES_PROGRESS_NAME}  pausa 429 · {remaining / 60:.0f} min  "
+            f"({done:,} done · {queued:,} en cola)"
+        )
+    elif current_slug:
+        desc += f"  · POST @{current_slug}"
+    elif waiting:
+        desc += f"  ({waiting} backoff)"
+    return done, done + queued, desc
+
+
+def _refresh_shelves_task(
+    progress: Progress | None,
+    task_id: TaskID | None,
+    frontier: Frontier,
+    client: Any,
+    *,
+    current_slug: str | None = None,
+) -> None:
+    if progress is None or task_id is None:
+        return
+    done, total, desc = shelves_progress(
+        frontier, client, current_slug=current_slug
+    )
+    progress.update(task_id, completed=done, total=max(total, 1), description=desc)
 
 
 # --------------------------------------------------------------------------
@@ -151,11 +214,43 @@ async def phase2_perfumes(
 # --------------------------------------------------------------------------
 
 
+HtmlCooldown = Callable[[StopCrawl, Path, CrawlConfig], Awaitable[None]]
+
+
+async def _html_cooldown(
+    exc: StopCrawl,
+    state_path: Path,
+    cfg: CrawlConfig,
+    *,
+    on_tick: Callable[[float, str], None] | None = None,
+) -> None:
+    """Pausa solo el GET de perfil: espera + un probe. Shelves no se toca.
+
+    Import tardio: daemon.py importa phase3_profiles.
+    """
+    from .daemon import DaemonState, save_state, wait_until_clear
+
+    state = DaemonState(
+        consecutive_blocks=0,
+        last_reason=exc.reason,
+        last_block_at=time.time(),
+    )
+    save_state(state_path, state)
+    console.print(
+        f"[red]HTML en cooldown ({exc.reason})[/red]: {exc}\n"
+        "Los POST de wardrobe siguen. El GET reanuda tras espera + probe."
+    )
+    await wait_until_clear(state, state_path, cfg, on_tick=on_tick)
+
+
 async def phase3_profiles(
     frontier: Frontier,
     client: Client,
     staging: Path,
     limit: int | None = None,
+    *,
+    state_path: Path | None = None,
+    html_cooldown: HtmlCooldown | None = None,
 ) -> None:
     users = ParquetWriter(staging, "users")
     inter = ParquetWriter(staging, "interactions_from_profile")
@@ -192,43 +287,107 @@ async def phase3_profiles(
         }
 
     html_error: BaseException | None = None
+    state_file = state_path or (DATA_DIR / "daemon_state.json")
 
-    async def run_html() -> None:
-        nonlocal html_error
-        try:
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        html_tid = progress.add_task(_HTML_PROGRESS_NAME, total=1)
+        shelves_tid: TaskID | None = None
+        if client.cfg.fetch_shelves:
+            shelves_tid = progress.add_task(_SHELVES_PROGRESS_NAME, total=1)
+            _refresh_shelves_task(progress, shelves_tid, frontier, client)
+
+        async def run_html() -> None:
+            # El 429 de pagina no corta la fase: esta tarea espera + probe y
+            # vuelve a run_phase. html_task sigue viva durante el cooldown, asi
+            # el daemon no se queda solo drenando shelves sin reanudar el GET.
+            nonlocal html_error
             with users, inter:
-                await run_phase(
-                    name="Fase 3: perfiles de usuario",
-                    kind="profile",
-                    frontier=frontier,
-                    client=client,
-                    writers={
-                        "users": users,
-                        "interactions_from_profile": inter,
-                    },
-                    handler=handle,
-                    limit=limit,
-                )
-        except BaseException as exc:
-            html_error = exc
-            raise
+                while True:
+                    try:
+                        await run_phase(
+                            name=_HTML_PROGRESS_NAME,
+                            kind="profile",
+                            frontier=frontier,
+                            client=client,
+                            writers={
+                                "users": users,
+                                "interactions_from_profile": inter,
+                            },
+                            handler=handle,
+                            limit=limit,
+                            cfg=client.cfg,
+                            progress=progress,
+                            task_id=html_tid,
+                        )
+                        return
+                    except StopCrawl as exc:
 
-    html_task = asyncio.create_task(run_html())
-    try:
-        with votes_out, wardrobe:
-            if client.cfg.fetch_shelves:
-                await run_shelves_loop(
-                    frontier, client, votes_out, wardrobe, html_task
-                )
-            await html_task
-    except BaseException:
-        if not html_task.done():
-            html_task.cancel()
-            try:
+                        def on_html_tick(left: float, phase: str) -> None:
+                            from .daemon import format_cooldown_left
+
+                            done_n, total_n, _ = queue_progress(
+                                frontier, "profile", _HTML_PROGRESS_NAME
+                            )
+                            if phase == "probe":
+                                desc = (
+                                    f"{_HTML_PROGRESS_NAME}  probe "
+                                    f"({done_n:,} done · wardrobe sigue)"
+                                )
+                            else:
+                                desc = (
+                                    f"{_HTML_PROGRESS_NAME}  cooldown {exc.reason} · "
+                                    f"{format_cooldown_left(left)} "
+                                    f"({done_n:,} done · wardrobe sigue)"
+                                )
+                            progress.update(
+                                html_tid,
+                                completed=done_n,
+                                total=max(total_n, 1),
+                                description=desc,
+                            )
+
+                        if html_cooldown is not None:
+                            await html_cooldown(exc, state_file, client.cfg)
+                        else:
+                            await _html_cooldown(
+                                exc,
+                                state_file,
+                                client.cfg,
+                                on_tick=on_html_tick,
+                            )
+                    except BaseException as exc:
+                        html_error = exc
+                        raise
+
+        html_task = asyncio.create_task(run_html())
+        try:
+            with votes_out, wardrobe:
+                if client.cfg.fetch_shelves:
+                    await run_shelves_loop(
+                        frontier,
+                        client,
+                        votes_out,
+                        wardrobe,
+                        html_task,
+                        progress=progress,
+                        task_id=shelves_tid,
+                    )
                 await html_task
-            except BaseException:
-                pass
-        raise
+        except BaseException:
+            if not html_task.done():
+                html_task.cancel()
+                try:
+                    await html_task
+                except BaseException:
+                    pass
+            raise
 
     if mismatches:
         console.print(f"[yellow]  {mismatches} discrepancias de member_id via avatar[/yellow]")
@@ -257,22 +416,29 @@ async def run_shelves_loop(
     votes_writer: ParquetWriter,
     wardrobe_writer: ParquetWriter,
     html_task: asyncio.Task,
+    progress: Progress | None = None,
+    task_id: TaskID | None = None,
 ) -> None:
     """Consume shelves_jobs. Un 429 pausa este loop, no el GET del perfil."""
     frontier.reclaim_stale(client.cfg.lease_timeout_seconds)
+    _refresh_shelves_task(progress, task_id, frontier, client)
 
     while True:
         if client._shelves_disabled or not client.cfg.fetch_shelves:
+            _refresh_shelves_task(progress, task_id, frontier, client)
             return
         if client.shelves_paused():
+            _refresh_shelves_task(progress, task_id, frontier, client)
             await asyncio.sleep(2.0)
             continue
         if not client.should_fetch_shelves():
+            _refresh_shelves_task(progress, task_id, frontier, client)
             await asyncio.sleep(2.0)
             continue
 
         rows = frontier.claim_shelves(1)
         if not rows:
+            _refresh_shelves_task(progress, task_id, frontier, client)
             html_done = html_task.done()
             html_failed = html_done and (
                 html_task.cancelled()
@@ -295,13 +461,18 @@ async def run_shelves_loop(
         slug = str(job["slug"])
         profile_url = str(job["profile_url"])
         user = User(member_id=mid, username_slug=slug)
+        _refresh_shelves_task(
+            progress, task_id, frontier, client, current_slug=slug
+        )
         try:
             parsed = await _shelves_for_profile(client, "", user, profile_url)
         except RateLimited as exc:
             frontier.requeue_shelves(mid, str(exc), client.cfg.shelves_cooldown)
+            _refresh_shelves_task(progress, task_id, frontier, client)
             continue
         except ChallengeDetected as exc:
             frontier.requeue_shelves(mid, str(exc), client.cfg.shelves_cooldown)
+            _refresh_shelves_task(progress, task_id, frontier, client)
             continue
         except FetchError as exc:
             delay = backoff_delay(
@@ -310,6 +481,7 @@ async def run_shelves_loop(
                 client.cfg.backoff_cap,
             )
             frontier.mark_shelves_failed(mid, str(exc), client.cfg.max_attempts, delay)
+            _refresh_shelves_task(progress, task_id, frontier, client)
             continue
         if parsed.votes:
             votes_writer.add_many(parsed.votes)
@@ -318,6 +490,7 @@ async def run_shelves_loop(
         votes_writer.flush()
         wardrobe_writer.flush()
         frontier.mark_shelves_done(mid)
+        _refresh_shelves_task(progress, task_id, frontier, client)
 
 
 async def _shelves_for_profile(

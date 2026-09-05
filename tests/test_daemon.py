@@ -7,6 +7,7 @@ from fragrantica.frontier import Frontier
 from fragrantica.pipeline.daemon import (
     DaemonState,
     cooldown_seconds,
+    format_cooldown_left,
     latest_block,
     next_phase,
     reason_from_error,
@@ -23,6 +24,13 @@ CFG = CrawlConfig(
     cooldown_challenge=1800,
     cooldown_cap=21600,
 )
+
+
+def test_format_cooldown_left() -> None:
+    assert format_cooldown_left(300) == "5.0 min"
+    assert format_cooldown_left(90) == "1.5 min"
+    assert format_cooldown_left(12) == "12 s"
+    assert format_cooldown_left(0) == "0 s"
 
 
 def test_cooldown_doubles_until_cap() -> None:
@@ -54,6 +62,26 @@ def test_next_phase_prefers_perfumes(tmp_path: Path) -> None:
     fr.add("https://x/@a", "profile", "a")
     assert next_phase(fr) == 3
     fr.add("https://x/p", "perfume", "1")
+    assert next_phase(fr) == 2
+    fr.close()
+
+
+def test_next_phase_prefers_designers(tmp_path: Path) -> None:
+    fr = Frontier(tmp_path / "f.db")
+    fr.add("https://x/@a", "profile", "a")
+    fr.add("https://x/p", "perfume", "1")
+    fr.add("https://x/designers/Chanel.html", "designer", "Chanel")
+    assert next_phase(fr) == 1
+    fr.close()
+
+
+def test_next_phase_seed_catalog_even_if_queues_empty(tmp_path: Path) -> None:
+    """Sin esto el daemon se iria con el slice Dior cerrado y no enumeraria el resto."""
+    fr = Frontier(tmp_path / "f.db")
+    assert next_phase(fr) is None
+    assert next_phase(fr, seed_catalog=True) == 1
+    fr.add("https://x/p", "perfume", "1")
+    assert next_phase(fr, seed_catalog=True) == 1
     assert next_phase(fr) == 2
     fr.close()
 

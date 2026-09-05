@@ -202,10 +202,16 @@ class Client:
             self._paused_until = until
             log.warning("pausa global de %.0fs: %s", seconds, reason)
 
-    async def _respect_breaker(self) -> None:
+    async def _respect_breaker(self, *, worker: int = 0) -> None:
         now = time.time()
-        if now < self._paused_until:
+        # El POST de wardrobe por FRAGRANTICA_SHELVES_PROXY no comparte IP
+        # con el GET. Un 429 de pagina (pause_all) no tiene que dormir esos
+        # POST: la barra quedaba "sin pausa" y el done no avanzaba.
+        shelves_on_own_ip = worker == SHELVES_WORKER and bool(self.cfg.shelves_proxies)
+        if not shelves_on_own_ip and now < self._paused_until:
             await asyncio.sleep(self._paused_until - now)
+            return
+        if shelves_on_own_ip:
             return
         if self.challenge_rate > self.cfg.challenge_rate_threshold:
             async with self._lock:
@@ -290,7 +296,7 @@ class Client:
         worker. Dejando que el item vuelva al frontier con backoff, el worker
         sigue con el siguiente y el fallido se reintenta despues.
         """
-        await self._respect_breaker()
+        await self._respect_breaker(worker=worker)
         await asyncio.sleep(random.uniform(self.cfg.delay_min, self.cfg.delay_max))
 
         session = await self._session_for(worker)
@@ -420,6 +426,10 @@ class Client:
     def shelves_paused(self, *, now: float | None = None) -> bool:
         t = now if now is not None else time.time()
         return t < self._shelves_paused_until
+
+    def shelves_pause_remaining(self, *, now: float | None = None) -> float:
+        t = now if now is not None else time.time()
+        return max(0.0, self._shelves_paused_until - t)
 
     def should_fetch_shelves(self, *, now: float | None = None) -> bool:
         """False si fetch_shelves esta apagado, 403 permanente, o pausa 429."""

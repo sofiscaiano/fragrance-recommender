@@ -289,6 +289,31 @@ def test_null_review_id_does_not_collapse_all_votes(tmp_path: Path) -> None:
     fr.close()
 
 
+def test_mixed_null_and_bigint_user_parquet_schema(tmp_path: Path) -> None:
+    """Un part todo-null infiere NULL; otro con signature_perfume_id infiere BIGINT."""
+    staging, final = tmp_path / "staging", tmp_path / "final"
+    _write(staging, "items", [_item(1)])
+    _write(staging, "interactions_from_perfume", [_inter(10, 1, "alice")])
+    with ParquetWriter(staging, "users", flush_every=1) as w:
+        w.add(_user(99, "alice", n=1))
+        w.add(
+            User(
+                member_id=100,
+                username_slug="bob",
+                n_reviews_scraped=1,
+                signature_perfume_id=31861,
+            )
+        )
+    fr = Frontier(tmp_path / "f.db")
+    fr.record_member_id("alice", 99)
+
+    rep = consolidate(staging, final, fr, _cfg(k_core=1, sensitivity_k_values=(1,)))
+
+    assert rep.users_clean == 2
+    assert rep.interactions_clean == 1
+    fr.close()
+
+
 def test_reset_rate_limited_clears_attempts(tmp_path: Path) -> None:
     fr = Frontier(tmp_path / "f.db")
     fr.add("https://x/1", "perfume", "1")
