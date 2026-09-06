@@ -18,6 +18,7 @@ from rich.table import Table
 from .config import CRAWL, DATA_DIR, DATASET
 from .frontier import Frontier
 from .http_client import Client, probe_site
+from .observability import setup_otel
 from .pipeline.consolidate import consolidate
 from .pipeline.daemon import run_daemon
 from .pipeline.runner import StopCrawl, queue_progress
@@ -133,9 +134,12 @@ def phase(
     limit: int = typer.Option(0, help="0 = sin limite"),
     data_dir: Path = typer.Option(DATA_DIR),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
+    otel: bool = typer.Option(False, "--otel", help="Emitir metricas OTLP (OTEL_EXPORTER_OTLP_ENDPOINT)"),
 ) -> None:
     """Corre una fase individual. Reanudable: reejecutar retoma donde quedo."""
     _setup(verbose)
+    if otel:
+        setup_otel()
     staging, final, db = _paths(data_dir)
 
     async def run() -> None:
@@ -341,12 +345,13 @@ def daemon(
 ) -> None:
     """Crawl continuo: fase 1 (marcas), 2 y 3. No se apaga en el primer 429.
 
-    Si Cloudflare corta, espera (30 min, 1 h, 2 h, tope 6 h), hace UN probe
-    y reanuda. Un worker, delay del config. Ctrl-C para parar; el frontier
+    Si Cloudflare corta, espera (429: 5 min y dobla; challenge: 30 min),
+    hace UN probe y reanuda. Un worker, delay del config. Ctrl-C para parar; el frontier
     queda reanudable. Con el slice Dior ya done, el primer ciclo pide el
     indice A-Z y encola el resto del catalogo.
     """
     _setup(verbose)
+    setup_otel()
     staging, _, db = _paths(data_dir)
     if CRAWL.shelves_proxies:
         console.print(

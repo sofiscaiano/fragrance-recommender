@@ -98,16 +98,30 @@ def probe_site(cfg: CrawlConfig = CRAWL) -> ProbeResult:
     Un 200 corto con "Just a moment" no cuenta como OK: es el interstitial
     disfrazado de pagina. El umbral de 100 KB es el HTML real (~1,8 MB).
     """
+    from .observability import classify_http, http_span, record_http
+
     proxy = random.choice(cfg.proxies) if cfg.proxies else None
-    resp = cffi.Session(impersonate="chrome", proxy=proxy).get(PROBE_URL, timeout=30)
+    started = time.monotonic()
+    with http_span("probe", "GET"):
+        resp = cffi.Session(impersonate="chrome", proxy=proxy).get(PROBE_URL, timeout=30)
+    elapsed = time.monotonic() - started
     body = resp.text or ""
     nbytes = len(body)
     if resp.status_code == 429:
+        outcome, status = classify_http(429)
+        record_http("probe", outcome, elapsed, status=status)
         return ProbeResult(resp.status_code, nbytes, False, "429")
-    if resp.status_code in (403, 503) or looks_like_challenge(body):
+    interstitial = looks_like_challenge(body)
+    if resp.status_code in (403, 503) or interstitial:
+        outcome, status = classify_http(resp.status_code, interstitial=interstitial)
+        record_http("probe", outcome, elapsed, status=status)
         return ProbeResult(resp.status_code, nbytes, False, "challenge")
     if resp.status_code == 200 and nbytes > 100_000:
+        outcome, status = classify_http(200)
+        record_http("probe", outcome, elapsed, status=status)
         return ProbeResult(resp.status_code, nbytes, True, None)
+    outcome, status = classify_http(resp.status_code)
+    record_http("probe", "error", elapsed, status=status)
     return ProbeResult(resp.status_code, nbytes, False, "other")
 
 
@@ -310,56 +324,77 @@ class Client:
             headers["Sec-Fetch-Mode"] = "cors"
             headers["Sec-Fetch-Site"] = "same-origin"
 
+        from .observability import classify_http, http_span, kind_from_url, record_http
+
+        metric_kind = kind_from_url(url, method=method)
         started = time.monotonic()
-        try:
-            if method == "POST":
-                resp = await session.post(
-                    url, data=data or {}, headers=headers or None, allow_redirects=True,
+        with http_span(metric_kind, method):
+            try:
+                if method == "POST":
+                    resp = await session.post(
+                        url, data=data or {}, headers=headers or None, allow_redirects=True,
+                    )
+                else:
+                    resp = await session.get(url, headers=headers or None, allow_redirects=True)
+            except Exception as exc:
+                self._record(False)
+                outcome, status = classify_http(0, network_error=True)
+                record_http(metric_kind, outcome, time.monotonic() - started, status=status)
+                raise FetchError(f"error de red en {url}: {exc}") from exc
+            elapsed = time.monotonic() - started
+
+            body = resp.text or ""
+
+            if resp.status_code == 404:
+                self._record(True)  # 404 es una respuesta valida, no un bloqueo
+                outcome, status = classify_http(404)
+                record_http(metric_kind, outcome, elapsed, status=status)
+                raise NotFound(url)
+
+            if resp.status_code == 429:
+                self._record(False)
+                retry_after = None
+                raw = resp.headers.get("Retry-After")
+                if raw:
+                    try:
+                        retry_after = float(raw)
+                    except ValueError:
+                        retry_after = None
+                # pause_all es para 429 de pagina (ritmo de IP). En ajax el cupo
+                # es del endpoint: frenar el HTML 5 min recreaba el 70/19.
+                if kind != "json":
+                    self.pause_all(
+                        retry_after or self.cfg.rate_limit_pause, f"HTTP 429 en {url}"
+                    )
+                outcome, status = classify_http(429)
+                record_http(metric_kind, outcome, elapsed, status=status)
+                raise RateLimited(f"HTTP 429 en {url}", retry_after)
+
+            interstitial = looks_like_challenge(body, kind=kind)
+            if resp.status_code in (403, 503) or interstitial:
+                self._record(False)
+                outcome, status = classify_http(
+                    resp.status_code, interstitial=interstitial
                 )
-            else:
-                resp = await session.get(url, headers=headers or None, allow_redirects=True)
-        except Exception as exc:
-            self._record(False)
-            raise FetchError(f"error de red en {url}: {exc}") from exc
-        elapsed = time.monotonic() - started
+                record_http(metric_kind, outcome, elapsed, status=status)
+                raise ChallengeDetected(f"HTTP {resp.status_code} / interstitial en {url}")
 
-        body = resp.text or ""
+            if resp.status_code >= 500:
+                self._record(True)
+                outcome, status = classify_http(resp.status_code)
+                record_http(metric_kind, outcome, elapsed, status=status)
+                raise FetchError(f"HTTP {resp.status_code} en {url}")
 
-        if resp.status_code == 404:
-            self._record(True)  # 404 es una respuesta valida, no un bloqueo
-            raise NotFound(url)
+            if resp.status_code != 200:
+                self._record(True)
+                outcome, status = classify_http(resp.status_code)
+                record_http(metric_kind, outcome, elapsed, status=status)
+                raise FetchError(f"HTTP inesperado {resp.status_code} en {url}")
 
-        if resp.status_code == 429:
-            self._record(False)
-            retry_after = None
-            raw = resp.headers.get("Retry-After")
-            if raw:
-                try:
-                    retry_after = float(raw)
-                except ValueError:
-                    retry_after = None
-            # pause_all es para 429 de pagina (ritmo de IP). En ajax el cupo
-            # es del endpoint: frenar el HTML 5 min recreaba el 70/19.
-            if kind != "json":
-                self.pause_all(
-                    retry_after or self.cfg.rate_limit_pause, f"HTTP 429 en {url}"
-                )
-            raise RateLimited(f"HTTP 429 en {url}", retry_after)
-
-        if resp.status_code in (403, 503) or looks_like_challenge(body, kind=kind):
-            self._record(False)
-            raise ChallengeDetected(f"HTTP {resp.status_code} / interstitial en {url}")
-
-        if resp.status_code >= 500:
             self._record(True)
-            raise FetchError(f"HTTP {resp.status_code} en {url}")
-
-        if resp.status_code != 200:
-            self._record(True)
-            raise FetchError(f"HTTP inesperado {resp.status_code} en {url}")
-
-        self._record(True)
-        return FetchResult(url=url, status=resp.status_code, body=body, elapsed=elapsed)
+            outcome, status = classify_http(200)
+            record_http(metric_kind, outcome, elapsed, status=status)
+            return FetchResult(url=url, status=resp.status_code, body=body, elapsed=elapsed)
 
     async def ensure_passphrase(self, sample_html: str = "", *, worker: int = 0) -> str | None:
         """Passphrase AES = `_pd(hostname)`. Cero GET extra al bundle.
@@ -421,6 +456,15 @@ class Client:
                 "shelves en pausa %.0f min: %s",
                 self.cfg.shelves_cooldown / 60,
                 reason,
+            )
+            from .observability import egress_via, record_cooldown
+
+            record_cooldown(
+                reason="429",
+                duration_s=self.cfg.shelves_cooldown,
+                phase=3,
+                via=egress_via(self.cfg, shelves=True),
+                kind="shelves",
             )
 
     def shelves_paused(self, *, now: float | None = None) -> bool:

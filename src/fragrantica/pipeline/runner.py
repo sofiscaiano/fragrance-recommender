@@ -41,6 +41,7 @@ from ..http_client import (
     NotFound,
     RateLimited,
 )
+from ..observability import attach_snapshot, record_records, record_runner_outcome
 from ..storage import ParquetWriter
 
 log = logging.getLogger(__name__)
@@ -150,6 +151,7 @@ async def run_phase(
     ack_lock = asyncio.Lock()
     processed = 0
     halt: BaseException | None = None
+    attach_snapshot(frontier=frontier)
 
     total_hint = frontier.pending_count(kind)
 
@@ -182,16 +184,20 @@ async def run_phase(
                         continue
                     writers[key].add_many(records)
                     stats.records[key] = stats.records.get(key, 0) + len(records)
+                    record_records(key, len(records))
                 pending_ack.append(url)
             stats.done += 1
 
         except NotFound:
+            # El GET ya conto HTTP 404. El runner marca skip en el frontier.
             frontier.mark_skipped(url, "404")
             stats.skipped += 1
         except AlreadyHave:
+            record_runner_outcome("already_have", kind)
             frontier.mark_done(url)
             stats.done += 1
         except SkipItem as exc:
+            record_runner_outcome("skip", kind)
             frontier.mark_skipped(url, str(exc))
             stats.skipped += 1
         except RateLimited as exc:
@@ -304,6 +310,7 @@ async def run_phase(
                     eta = frontier.next_retry_eta(kind)
                     sleep_for = max(2.0, min(60.0, (eta or 0) - time.time())) if eta else 2.0
                     _refresh_queue_task(live, task, frontier, kind, name)
+                    attach_snapshot(frontier=frontier)
                     await asyncio.sleep(sleep_for)
                 else:
                     await asyncio.sleep(2.0)
@@ -314,6 +321,7 @@ async def run_phase(
             )
             await flush_and_ack()
             _refresh_queue_task(live, task, frontier, kind, name)
+            attach_snapshot(frontier=frontier)
             if halt is not None:
                 break
 

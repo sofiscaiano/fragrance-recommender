@@ -24,6 +24,7 @@ from ..config import BASE_URL, CRAWL, DATA_DIR, DATASET, CrawlConfig, DatasetCon
 from ..frontier import Frontier, backoff_delay
 from ..http_client import ChallengeDetected, Client, FetchError, NotFound, RateLimited, absolute
 from ..models import User
+from ..observability import attach_snapshot, record_records
 from ..parsers.crypto import DecryptError, unwrap_ajax_body
 from ..parsers.designer import (
     designer_slug_from_perfume_url,
@@ -223,13 +224,16 @@ async def _html_cooldown(
     cfg: CrawlConfig,
     *,
     on_tick: Callable[[float, str], None] | None = None,
+    frontier: Frontier | None = None,
 ) -> None:
     """Pausa solo el GET de perfil: espera + un probe. Shelves no se toca.
 
     Import tardio: daemon.py importa phase3_profiles.
     """
+    from ..observability import record_block
     from .daemon import DaemonState, save_state, wait_until_clear
 
+    record_block(exc.reason)
     state = DaemonState(
         consecutive_blocks=0,
         last_reason=exc.reason,
@@ -240,7 +244,9 @@ async def _html_cooldown(
         f"[red]HTML en cooldown ({exc.reason})[/red]: {exc}\n"
         "Los POST de wardrobe siguen. El GET reanuda tras espera + probe."
     )
-    await wait_until_clear(state, state_path, cfg, on_tick=on_tick)
+    await wait_until_clear(
+        state, state_path, cfg, on_tick=on_tick, frontier=frontier, phase=3
+    )
 
 
 async def phase3_profiles(
@@ -361,6 +367,7 @@ async def phase3_profiles(
                                 state_file,
                                 client.cfg,
                                 on_tick=on_html_tick,
+                                frontier=frontier,
                             )
                     except BaseException as exc:
                         html_error = exc
@@ -485,11 +492,14 @@ async def run_shelves_loop(
             continue
         if parsed.votes:
             votes_writer.add_many(parsed.votes)
+            record_records("interactions", len(parsed.votes))
         if parsed.wardrobe:
             wardrobe_writer.add_many(parsed.wardrobe)
+            record_records("wardrobe", len(parsed.wardrobe))
         votes_writer.flush()
         wardrobe_writer.flush()
         frontier.mark_shelves_done(mid)
+        attach_snapshot(frontier=frontier)
         _refresh_shelves_task(progress, task_id, frontier, client)
 
 

@@ -6,6 +6,7 @@ from fragrantica.config import CrawlConfig
 from fragrantica.frontier import Frontier
 from fragrantica.pipeline.daemon import (
     DaemonState,
+    can_divert_perfume_429,
     cooldown_seconds,
     format_cooldown_left,
     latest_block,
@@ -31,6 +32,14 @@ def test_format_cooldown_left() -> None:
     assert format_cooldown_left(90) == "1.5 min"
     assert format_cooldown_left(12) == "12 s"
     assert format_cooldown_left(0) == "0 s"
+
+
+def test_production_delay_and_429_cooldown() -> None:
+    """Cupo ~400 GETs /perfume/ por IP. 7-10 s acorta la rafaga; cooldown 429 5 min."""
+    cfg = CrawlConfig()
+    assert cfg.delay_min == 7
+    assert cfg.delay_max == 10
+    assert cfg.cooldown_429 == 300
 
 
 def test_cooldown_doubles_until_cap() -> None:
@@ -108,9 +117,43 @@ def test_seed_state_inherits_frontier_block(tmp_path: Path) -> None:
     fr.close()
 
 
+def test_seed_state_ignores_deferred_quarantine(tmp_path: Path) -> None:
+    """Cuarentena (canario OK) no es bloqueo de IP: un restart no espera 30 min."""
+    fr = Frontier(tmp_path / "f.db")
+    fr.add("https://x/dioressence", "perfume", "1")
+    fr.mark_deferred(
+        "https://x/dioressence",
+        "HTTP 200 / interstitial en https://x/dioressence",
+        delay=86_400,
+    )
+    assert latest_block(fr) is None
+    seeded = seed_state_from_frontier(DaemonState(), fr)
+    assert seeded.last_block_at == 0.0
+    fr.close()
+
+
 def test_next_phase_stays_on_3_when_only_shelves_remain(tmp_path: Path) -> None:
     fr = Frontier(tmp_path / "f.db")
     assert next_phase(fr) is None
     fr.enqueue_shelves(1, "a", "https://www.fragrantica.com/@a")
     assert next_phase(fr) == 3
+    fr.close()
+
+
+def test_next_phase_skips_perfume_when_quota_full(tmp_path: Path) -> None:
+    """Fase 2 sigue primero; skip_kinds solo despues de un 429 en este ciclo."""
+    fr = Frontier(tmp_path / "f.db")
+    fr.add("https://x/p", "perfume", "1")
+    fr.add("https://x/@a", "profile", "a")
+    assert next_phase(fr) == 2
+    assert next_phase(fr, skip_kinds=("perfume",)) == 3
+    assert can_divert_perfume_429(fr) is True
+    fr.close()
+
+
+def test_cannot_divert_perfume_429_without_profiles(tmp_path: Path) -> None:
+    fr = Frontier(tmp_path / "f.db")
+    fr.add("https://x/p", "perfume", "1")
+    assert can_divert_perfume_429(fr) is False
+    assert next_phase(fr, skip_kinds=("perfume",)) is None
     fr.close()

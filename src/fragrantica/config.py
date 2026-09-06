@@ -40,6 +40,9 @@ class CrawlConfig:
 
     # Jitter uniforme por worker. Un delay fijo es en si mismo una firma de bot,
     # mas detectable que ir un poco mas rapido de forma irregular.
+    # El 429 de perfume es cupo de ~400 GETs /perfume/ por IP, no una ventana
+    # de 1 h: 7-10 s y 10-15 s mueren en el mismo conteo. Ir mas lento no
+    # agranda el cupo. 5-12 s en IP nueva disparo interstitial.
     delay_min: float = field(default_factory=lambda: _env_float("FRAGRANTICA_DELAY_MIN", 7))
     delay_max: float = field(default_factory=lambda: _env_float("FRAGRANTICA_DELAY_MAX", 10))
 

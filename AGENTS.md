@@ -24,7 +24,7 @@ Documentos hermanos: [`PLAN.md`](PLAN.md) tiene el análisis del sitio y las
 decisiones de diseño con su justificación. [`README.md`](README.md) tiene el uso
 operativo. **Este archivo no los duplica**; se centra en estado y contexto.
 
-## Estado actual (última actualización: daemon continuo, jitter 10–20 s)
+## Estado actual (última actualización: daemon continuo, jitter 7–10 s)
 
 Se implementó el pipeline completo y un **vertical slice sobre Dior**. El
 crawl one-shot se cortaba en el primer interstitial; ahora el comando
@@ -64,17 +64,38 @@ volvieron a la cola. El daemon las retoma cuando el probe da 200.
 | 6 workers, jitter 0.4–2.0s (~5 req/s) | HTTP 429 sostenido tras ~150 requests |
 | 1 worker, jitter 5–12 s | interstitial tras un puñado de requests en IP recién rotada |
 | 1 worker, jitter 20–40 s + daemon | ~88 páginas OK en 45 min; interstitial en Dioressence |
-| 1 worker, jitter 10–20 s + daemon | default actual (no subir concurrency) |
+| 1 worker, jitter 7–10 s + daemon | default actual (~400 GETs `/perfume/` por IP) |
 
-Un burst corto **no** detecta el 429. Seguir pidiendo después de un interstitial
-es lo que escala a 403 de IP. El daemon **no** martillea: espera 30 min / 1 h /
-2 h (tope 6 h), hace **un** probe, y solo entonces reanuda.
+Un burst corto **no** detecta el 429. Siete ráfagas del 5-sep-2026 cortaron
+todas en **~397–400 GETs de `/perfume/`** (7–10 s → ~60 min; 10–15 s → ~85 min,
+mismo conteo). No es una ventana de 1 h. En el browser el 429 sale en fichas
+de perfume, no en perfiles. El daemon **arranca siempre en fase 2**; solo
+si un 429 sale en este ciclo **pasa a fase 3**. Un 429 viejo en disco no
+desvía: si rotaron la IP, el cupo está limpio. Challenge: espera 30 min y dobla.
 
 ```bash
 .venv/bin/fragrantica daemon    # el proceso que hay que dejar vivo
 .venv/bin/fragrantica status
 pgrep -fl fragrantica           # un solo proceso
 ```
+
+## Monitor: Maple, no Grafana
+
+El dashboard es **[Maple](https://maple.dev/) en local**. Nunca Grafana, Loki
+ni Prometheus: un agente que abra `localhost:3000` o el compose de
+`observability/` se equivoca de herramienta.
+
+```bash
+maple start --offline
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+export OTEL_SERVICE_NAME=fragrantica-scraper
+.venv/bin/fragrantica daemon
+```
+
+UI: `http://127.0.0.1:4318` (o el link de `local.maple.dev`) → servicio
+`fragrantica-scraper` → **Metrics**. Fallos HTTP: `fragrantica.http.failures`
+(`status_code`, `via`). Cooldowns: `fragrantica.daemon.cooldowns` (`phase`, `via`).
+Logs de consola: pestaña Logs. Detalle operativo en [`README.md`](README.md).
 
 Comandos de higiene del frontier:
 
@@ -192,6 +213,7 @@ src/fragrantica/
 ├── config.py            CrawlConfig (red, cortesía) y DatasetConfig (umbrales)
 ├── models.py            Item / User / Interaction (Pydantic v2, valida esquema)
 ├── http_client.py       curl_cffi + rotación de perfiles, jitter, circuit breaker
+├── observability.py     OTLP a Maple (métricas, logs, spans); no-op sin endpoint
 ├── frontier.py          máquina de estados del crawl en SQLite  <-- pieza clave
 ├── storage.py           writers Parquet atómicos (.tmp + rename)
 ├── parsers/
@@ -250,7 +272,7 @@ Cuatro invariantes que **no hay que romper** al modificar el runner:
 ## Cómo correr
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+python3 -m venv .venv && .venv/bin/pip install -e .
 
 .venv/bin/python -m pytest tests/ -q        # tests, ~1s, sin red
 .venv/bin/fragrantica status
@@ -283,9 +305,10 @@ Para trabajo iterativo sobre parsers hay un script de salida legible:
 2. **`.gitignore` ya está.** Cubre `.venv/`, `data/` y caches. No commitear
    `data/final/PRIVATE_user_mapping.parquet` si alguien relaja el ignore.
 
-3. **No subir `concurrency`.** El 429 fue ritmo agregado. Acelerar = bajar
-   `delay_min`/`delay_max` (ahora 10–20 s). Si vuelve el interstitial, el
-   daemon espera; no compensar con más workers.
+3. **No subir `concurrency`.** El 429 de perfume es cupo de ~400 GETs por IP,
+   no ritmo instantáneo. `delay_min`/`delay_max` (ahora 7–10 s) solo acorta
+   la ráfaga. Si vuelve el interstitial, el daemon espera; no compensar con
+   más workers.
 
 4. **`reviews_total` es aproximado** en items populares: el sitio lo muestra
    abreviado ("4.2K"). La columna `reviews_total_is_approx` lo marca. No usarlo
@@ -311,3 +334,7 @@ Para trabajo iterativo sobre parsers hay un script de salida legible:
 - Los endpoints `/ajax` están en alcance por decisión explícita del usuario
   (`CrawlConfig.fetch_shelves`). No reabrir esa discusión: si hay que
   apagarlos, `fetch_shelves=False`.
+- **Observabilidad = Maple.** No proponer Grafana ni abrir paneles de Grafana.
+- **Commitear al terminar.** En este repo, cuando se completa el trabajo pedido,
+  hay que hacer commit de todos los cambios (tests en verde). No hace falta que
+  lo vuelvan a pedir; no dejar el working tree sucio "para después".
