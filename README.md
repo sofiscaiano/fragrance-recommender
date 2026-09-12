@@ -46,11 +46,12 @@ Todas son reanudables: reejecutar el mismo comando retoma donde quedó.
 ### Monitoreo
 
 ```bash
-.venv/bin/fragrantica daemon      # fase 1 → 2 → 3, no se apaga en el 429
-.venv/bin/fragrantica status      # estado del frontier
-.venv/bin/fragrantica probe       # un request: ¿ya se levantó el bloqueo?
-.venv/bin/fragrantica reset-429   # rehabilitar URLs caídas por 429/403
-.venv/bin/fragrantica retry-dead  # devolver dead-letters a la cola
+.venv/bin/fragrantica daemon          # fase 1 → 2 → 3, no se apaga en el 429
+.venv/bin/fragrantica status          # estado del frontier
+.venv/bin/fragrantica probe           # un request: ¿ya se levantó el bloqueo?
+.venv/bin/fragrantica clear-cooldown  # no heredar espera de interstitial/429 viejos
+.venv/bin/fragrantica reset-429       # rehabilitar URLs caídas por 429/403
+.venv/bin/fragrantica retry-dead      # devolver dead-letters a la cola
 ```
 
 `status` lee del frontier en SQLite, así que refleja el estado real y sobrevive
@@ -94,7 +95,8 @@ El estado del crawl vive en `data/frontier.db`, commiteado transaccionalmente.
 - **HTTP 429**: `phase` se detiene (exit 2). El daemon espera, un probe, y reanuda.
 - **Interstitial**: canario a Sauvage **en la misma sesión**. Si el canario
   pasa, esa URL va a `deferred` (reintento en 12 h) y el lote sigue. Si el
-  canario también falla, se corta igual que el 429.
+  canario también falla, se corta igual que el 429. Para arrancar sin heredar
+  esa espera: `fragrantica clear-cooldown` o borrar `data/daemon_state.json`.
 - **`kill -9` o corte de luz**: igual que Ctrl-C. Nunca hay estado crítico solo
   en memoria, y las escrituras a Parquet son atómicas (`.tmp` + rename).
 

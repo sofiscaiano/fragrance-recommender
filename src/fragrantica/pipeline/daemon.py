@@ -44,6 +44,37 @@ class DaemonState:
     consecutive_blocks: int = 0
     last_reason: str = "challenge"
     last_block_at: float = 0.0
+    # Bloqueos del frontier con timestamp <= esto no se heredan al arrancar.
+    # Borrar daemon_state.json o `fragrantica clear-cooldown` lo setea a now.
+    cleared_at: float = 0.0
+
+
+def cleared_state(*, now: float | None = None) -> DaemonState:
+    """Estado sin cooldown activo. El frontier no puede re-sembrar errores viejos."""
+    return DaemonState(cleared_at=now if now is not None else time.time())
+
+
+def forget_cooldown(path: Path, *, now: float | None = None) -> DaemonState:
+    """Olvida la espera. No toca last_error de las URLs: solo el watchdog."""
+    state = cleared_state(now=now)
+    save_state(path, state)
+    return state
+
+
+def state_after_block(
+    reason: str,
+    previous: DaemonState,
+    *,
+    consecutive: int = 0,
+    at: float | None = None,
+) -> DaemonState:
+    """Nuevo bloqueo de este proceso. Conserva cleared_at para no reabrir los viejos."""
+    return DaemonState(
+        consecutive_blocks=consecutive,
+        last_reason=reason,
+        last_block_at=at if at is not None else time.time(),
+        cleared_at=previous.cleared_at,
+    )
 
 
 def cooldown_seconds(
@@ -140,16 +171,18 @@ def remaining_wait(
 
 def load_state(path: Path) -> DaemonState:
     if not path.exists():
-        return DaemonState()
+        # Borrar el JSON es un clear explicito: no heredar interstitial/429 del frontier.
+        return cleared_state()
     try:
         raw = json.loads(path.read_text())
         return DaemonState(
             consecutive_blocks=int(raw.get("consecutive_blocks", 0)),
             last_reason=str(raw.get("last_reason") or "challenge"),
             last_block_at=float(raw.get("last_block_at") or 0.0),
+            cleared_at=float(raw.get("cleared_at") or 0.0),
         )
     except (OSError, ValueError, TypeError):
-        return DaemonState()
+        return cleared_state()
 
 
 def save_state(path: Path, state: DaemonState) -> None:
@@ -162,16 +195,22 @@ def seed_state_from_frontier(state: DaemonState, frontier: Frontier) -> DaemonSt
 
     Evita que un restart del daemon pegue un probe a los 2 minutos de un
     interstitial: usaria el cooldown corto otra vez.
+
+    Un `cleared_at` (borrar el JSON o `clear-cooldown`) corta esa herencia:
+    los last_error viejos siguen en el frontier, pero ya no disparan espera.
     """
     found = latest_block(frontier)
     if not found:
         return state
     ts, reason = found
+    if ts <= state.cleared_at:
+        return state
     if ts > state.last_block_at:
         return DaemonState(
             consecutive_blocks=state.consecutive_blocks,
             last_reason=reason,
             last_block_at=ts,
+            cleared_at=state.cleared_at,
         )
     return state
 
@@ -276,16 +315,16 @@ async def wait_until_clear(
                 console.print(
                     f"[green]probe OK[/green] {result.status} {result.nbytes:,} bytes"
                 )
-                state = DaemonState()
+                state = cleared_state()
                 save_state(state_path, state)
                 attach_snapshot(frontier=frontier, state=state, cooldown_remaining=0.0)
                 return state
 
             reason = result.blocked or "other"
-            state = DaemonState(
-                consecutive_blocks=state.consecutive_blocks + 1,
-                last_reason=reason if reason in ("429", "challenge") else "challenge",
-                last_block_at=time.time(),
+            state = state_after_block(
+                reason if reason in ("429", "challenge") else "challenge",
+                state,
+                consecutive=state.consecutive_blocks + 1,
             )
             save_state(state_path, state)
             nxt = cooldown_seconds(state.last_reason, state.consecutive_blocks, cfg)
@@ -374,11 +413,7 @@ async def run_daemon(
                 and can_divert_perfume_429(frontier)
             ):
                 skip_perfume = True
-                state = DaemonState(
-                    consecutive_blocks=0,
-                    last_reason="429",
-                    last_block_at=time.time(),
-                )
+                state = state_after_block("429", state)
                 save_state(state_path, state)
                 attach_snapshot(frontier=frontier, state=state, phase=3)
                 console.print(
@@ -388,11 +423,7 @@ async def run_daemon(
                 continue
             skip_perfume = False
             # Challenge, o 429 de perfil, o perfume 429 sin cola de users.
-            state = DaemonState(
-                consecutive_blocks=0,
-                last_reason=exc.reason,
-                last_block_at=time.time(),
-            )
+            state = state_after_block(exc.reason, state)
             save_state(state_path, state)
             attach_snapshot(frontier=frontier, state=state, phase=phase)
             console.print(
@@ -416,7 +447,7 @@ async def run_daemon(
                 )
             continue
 
-        state = DaemonState()
+        state = cleared_state()
         save_state(state_path, state)
         attach_snapshot(frontier=frontier, state=state, phase=phase, cooldown_remaining=0.0)
         log.info("fase %s vacia, paso a la siguiente", phase)

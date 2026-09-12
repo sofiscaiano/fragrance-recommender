@@ -102,6 +102,7 @@ Comandos de higiene del frontier:
 ```bash
 .venv/bin/fragrantica reset-429          # pending+attempts=0 para 429/403/interstitial
 .venv/bin/fragrantica retry-dead         # dead-letters genéricos
+.venv/bin/fragrantica clear-cooldown     # no heredar espera; borrar daemon_state.json también
 .venv/bin/fragrantica enqueue-shelves    # HTML ya done, sin closet → cola de POST
 .venv/bin/fragrantica requeue-profiles   # perfiles already-done → pending (2º pase GET)
 .venv/bin/fragrantica status

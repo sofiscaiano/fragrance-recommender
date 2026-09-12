@@ -231,14 +231,10 @@ async def _html_cooldown(
     Import tardio: daemon.py importa phase3_profiles.
     """
     from ..observability import record_block
-    from .daemon import DaemonState, save_state, wait_until_clear
+    from .daemon import load_state, save_state, state_after_block, wait_until_clear
 
     record_block(exc.reason)
-    state = DaemonState(
-        consecutive_blocks=0,
-        last_reason=exc.reason,
-        last_block_at=time.time(),
-    )
+    state = state_after_block(exc.reason, load_state(state_path))
     save_state(state_path, state)
     console.print(
         f"[red]HTML en cooldown ({exc.reason})[/red]: {exc}\n"

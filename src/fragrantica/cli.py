@@ -20,7 +20,7 @@ from .frontier import Frontier
 from .http_client import Client, probe_site
 from .observability import setup_otel
 from .pipeline.consolidate import consolidate
-from .pipeline.daemon import run_daemon
+from .pipeline.daemon import forget_cooldown, run_daemon
 from .pipeline.runner import StopCrawl, queue_progress
 from .pipeline.phases import (
     phase1_enumerate,
@@ -314,6 +314,24 @@ def reset_429(
     n = frontier.reset_rate_limited(kind or None)  # type: ignore[arg-type]
     console.print(f"{n} URLs rehabilitadas tras 429")
     frontier.close()
+
+
+@app.command("clear-cooldown")
+def clear_cooldown_cmd(
+    data_dir: Path = typer.Option(DATA_DIR),
+) -> None:
+    """Olvida el cooldown del daemon para el proximo arranque.
+
+    Equivale a borrar `daemon_state.json`: no hereda interstitial/429 viejos
+    del frontier. No toca las colas ni el last_error de las URLs. Un bloqueo
+    nuevo en esta corrida vuelve a esperar.
+    """
+    path = data_dir / "daemon_state.json"
+    forget_cooldown(path)
+    console.print(
+        "Cooldown olvidado. El proximo [bold]fragrantica daemon[/bold] "
+        "no espera ni hereda el bloqueo viejo del frontier."
+    )
 
 
 @app.command("prune-slice")

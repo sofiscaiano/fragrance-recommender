@@ -8,8 +8,10 @@ from fragrantica.pipeline.daemon import (
     DaemonState,
     can_divert_perfume_429,
     cooldown_seconds,
+    forget_cooldown,
     format_cooldown_left,
     latest_block,
+    load_state,
     next_phase,
     reason_from_error,
     remaining_wait,
@@ -115,6 +117,53 @@ def test_seed_state_inherits_frontier_block(tmp_path: Path) -> None:
     assert seeded.last_reason == "challenge"
     assert seeded.last_block_at == ts
     fr.close()
+
+
+def test_seed_state_respects_cleared_at(tmp_path: Path) -> None:
+    """Borrar el JSON o clear-cooldown no reabre un interstitial viejo del frontier."""
+    fr = Frontier(tmp_path / "f.db")
+    fr.add("https://x/p", "perfume", "1")
+    fr.requeue("https://x/p", "HTTP 200 / interstitial en https://x/p", delay=0)
+    ts, _ = latest_block(fr)
+    seeded = seed_state_from_frontier(DaemonState(cleared_at=ts), fr)
+    assert seeded.last_block_at == 0.0
+    later = seed_state_from_frontier(DaemonState(cleared_at=ts - 1), fr)
+    assert later.last_block_at == ts
+    fr.close()
+
+
+def test_missing_daemon_state_does_not_inherit_frontier(tmp_path: Path) -> None:
+    fr = Frontier(tmp_path / "f.db")
+    fr.add("https://x/p", "perfume", "1")
+    fr.requeue("https://x/p", "HTTP 200 / interstitial en https://x/p", delay=0)
+    path = tmp_path / "daemon_state.json"
+    assert not path.exists()
+    seeded = seed_state_from_frontier(load_state(path), fr)
+    assert seeded.last_block_at == 0.0
+    assert seeded.cleared_at > 0
+    fr.close()
+
+
+def test_forget_cooldown_survives_restart(tmp_path: Path) -> None:
+    fr = Frontier(tmp_path / "f.db")
+    fr.add("https://x/p", "perfume", "1")
+    fr.requeue("https://x/p", "HTTP 200 / interstitial en https://x/p", delay=0)
+    path = tmp_path / "daemon_state.json"
+    forget_cooldown(path)
+    seeded = seed_state_from_frontier(load_state(path), fr)
+    assert seeded.last_block_at == 0.0
+    assert path.exists()
+    fr.close()
+
+
+def test_load_state_keeps_active_cooldown(tmp_path: Path) -> None:
+    from fragrantica.pipeline.daemon import save_state
+
+    path = tmp_path / "daemon_state.json"
+    save_state(path, DaemonState(last_reason="challenge", last_block_at=1_000.0))
+    loaded = load_state(path)
+    assert loaded.last_block_at == 1_000.0
+    assert loaded.cleared_at == 0.0
 
 
 def test_seed_state_ignores_deferred_quarantine(tmp_path: Path) -> None:
