@@ -76,7 +76,17 @@ CREATE INDEX IF NOT EXISTS idx_shelves_claimable
 
 
 class Frontier:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, readonly: bool = False) -> None:
+        if readonly:
+            # La fase 6 corre en paralelo al daemon: no tocar WAL ni SCHEMA.
+            uri = path.resolve().as_posix()
+            self.conn = sqlite3.connect(
+                f"file:{uri}?mode=ro",
+                uri=True,
+                timeout=60.0,
+            )
+            self.conn.row_factory = sqlite3.Row
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path, timeout=60.0, isolation_level=None)
         self.conn.row_factory = sqlite3.Row

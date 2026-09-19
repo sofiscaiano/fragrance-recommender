@@ -191,6 +191,19 @@ def test_state_survives_reopen(tmp_path):
     f2.close()
 
 
+def test_readonly_reads_member_ids_without_write(tmp_path):
+    db = tmp_path / "f.db"
+    w = Frontier(db)
+    w.record_member_id("alice", 99)
+    w.close()
+
+    ro = Frontier(db, readonly=True)
+    assert ro.member_id_map() == {"alice": 99}
+    with pytest.raises(Exception):
+        ro.record_member_id("bob", 1)
+    ro.close()
+
+
 def test_drop_perfumes_not_from_keeps_done(fr):
     fr.add("https://www.fragrantica.com/perfume/Dior/A-1.html", "perfume", "1")
     fr.add("https://www.fragrantica.com/perfume/Le-Labo/B-2.html", "perfume", "2")

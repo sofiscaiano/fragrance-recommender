@@ -7,6 +7,8 @@ Fase 6  dedup, integridad referencial, k-core iterativo, export
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,22 +45,37 @@ class ConsolidationReport:
         return d
 
 
-def _glob(staging: Path, name: str) -> str | None:
+def _parquet_files(staging: Path, name: str) -> list[str]:
+    """Lista fija de parts: un snapshot, no un glob que crece mientras el daemon escribe."""
     d = staging / name
-    if not d.exists() or not any(d.glob("*.parquet")):
-        return None
-    return str(d / "*.parquet")
+    if not d.exists():
+        return []
+    return sorted(str(p) for p in d.glob("*.parquet") if p.is_file())
 
 
-def _read(src: str) -> str:
-    """Lee un glob de parts.
+def _load_parquet(con: duckdb.DuckDBPyConnection, files: list[str], table: str) -> None:
+    """Lee parts con union_by_name.
 
     Cada flush de ParquetWriter infiere el esquema del batch. Un part donde
     `signature_perfume_id` (u otra columna opcional) es todo-null queda tipado
     como NULL; el siguiente, con un entero, como BIGINT. Sin union_by_name
     DuckDB toma el primer archivo y el resto explota al castear.
     """
-    return f"read_parquet('{src}', union_by_name=true)"
+    con.execute(
+        f"CREATE TABLE {table} AS SELECT * FROM read_parquet(?, union_by_name=true)",
+        [files],
+    )
+
+
+def _export_parquet(con: duckdb.DuckDBPyConnection, select_sql: str, dest: Path) -> None:
+    """COPY a un .tmp y rename: si el proceso muere no deja el parquet final a medias."""
+    tmp = dest.with_name(dest.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    dest_sql = str(tmp).replace("'", "''")
+    con.execute(
+        f"COPY ({select_sql}) TO '{dest_sql}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+    )
+    os.replace(tmp, dest)
 
 
 def consolidate(
@@ -68,20 +85,49 @@ def consolidate(
     cfg: DatasetConfig = DATASET,
 ) -> ConsolidationReport:
     final.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect()
+    work = final.parent / "_consolidate_work"
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True, exist_ok=True)
+
+    con = duckdb.connect(str(work / "work.duckdb"))
+    work_sql = str(work).replace("'", "''")
+    con.execute(f"SET temp_directory='{work_sql}'")
+    con.execute("SET preserve_insertion_order=false")
+    con.execute("SET memory_limit='6GB'")
     rep = ConsolidationReport()
 
-    # ---- carga -----------------------------------------------------------
-    sources = []
-    if (p := _glob(staging, "interactions_from_perfume")):
-        sources.append(p)
-    if (p := _glob(staging, "interactions_from_profile")):
-        sources.append(p)
-    if not sources:
+    try:
+        return _consolidate(con, staging, final, frontier, cfg, rep)
+    finally:
+        con.close()
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _consolidate(
+    con: duckdb.DuckDBPyConnection,
+    staging: Path,
+    final: Path,
+    frontier: Frontier,
+    cfg: DatasetConfig,
+    rep: ConsolidationReport,
+) -> ConsolidationReport:
+    # ---- carga (lista de archivos congelada al arrancar) -----------------
+    inter_files = _parquet_files(staging, "interactions_from_perfume") + _parquet_files(
+        staging, "interactions_from_profile"
+    )
+    item_files = _parquet_files(staging, "items")
+    user_files = _parquet_files(staging, "users")
+    wardrobe_files = _parquet_files(staging, "wardrobe")
+    if not inter_files:
         raise RuntimeError("no hay interacciones en staging; corre las fases 2 y 3 primero")
 
-    union = " UNION ALL BY NAME ".join(f"SELECT * FROM {_read(s)}" for s in sources)
-    con.execute(f"CREATE TABLE raw_inter AS {union}")
+    console.print(
+        f"[dim]snapshot staging: {len(item_files):,} items · "
+        f"{len(user_files):,} users · {len(inter_files):,} inter · "
+        f"{len(wardrobe_files):,} wardrobe[/dim]"
+    )
+    _load_parquet(con, inter_files, "raw_inter")
     rep.interactions_raw = con.execute("SELECT count(*) FROM raw_inter").fetchone()[0]
 
     # ---- Fase 4: resolucion de member_id ---------------------------------
@@ -134,30 +180,30 @@ def consolidate(
     rep.interactions_deduped = con.execute("SELECT count(*) FROM inter_dedup").fetchone()[0]
 
     # ---- items y users ---------------------------------------------------
-    items_src = _glob(staging, "items")
-    if items_src:
+    if item_files:
+        _load_parquet(con, item_files, "items_raw")
         con.execute(
-            f"""
+            """
             CREATE TABLE items AS
             SELECT * EXCLUDE (rn) FROM (
                 SELECT *, row_number() OVER (
                     PARTITION BY perfume_id ORDER BY reviews_scraped DESC
-                ) AS rn FROM {_read(items_src)}
+                ) AS rn FROM items_raw
             ) WHERE rn = 1
             """
         )
     else:
         con.execute("CREATE TABLE items AS SELECT NULL::BIGINT AS perfume_id WHERE false")
 
-    users_src = _glob(staging, "users")
-    if users_src:
+    if user_files:
+        _load_parquet(con, user_files, "users_raw")
         con.execute(
-            f"""
+            """
             CREATE TABLE users AS
             SELECT * EXCLUDE (rn) FROM (
                 SELECT *, row_number() OVER (
                     PARTITION BY member_id ORDER BY n_reviews_scraped DESC
-                ) AS rn FROM {_read(users_src)}
+                ) AS rn FROM users_raw
             ) WHERE rn = 1
             """
         )
@@ -179,9 +225,8 @@ def consolidate(
     # referencial contra users+items, sin filtrar por k-core: un perfume
     # en la coleccion no deberia desaparecer porque el usuario no llego
     # al umbral de reviews.
-    wardrobe_src = _glob(staging, "wardrobe")
-    if wardrobe_src:
-        con.execute(f"CREATE TABLE wardrobe_raw AS SELECT * FROM {_read(wardrobe_src)}")
+    if wardrobe_files:
+        _load_parquet(con, wardrobe_files, "wardrobe_raw")
         con.execute(
             """
             CREATE TABLE wardrobe_resolved AS
@@ -291,38 +336,36 @@ def consolidate(
     salt_sql = cfg.username_salt.replace("'", "''")
     hash_expr = f"substr(sha256(username_slug || '{salt_sql}'), 1, 16)"
 
-    con.execute(
-        f"""COPY (
-            SELECT * EXCLUDE (username_slug), {hash_expr} AS user_hash
-            FROM kcore
-        ) TO '{final / "interactions.parquet"}' (FORMAT PARQUET, COMPRESSION ZSTD)"""
+    _export_parquet(
+        con,
+        f"SELECT * EXCLUDE (username_slug), {hash_expr} AS user_hash FROM kcore",
+        final / "interactions.parquet",
     )
-    con.execute(
-        f"""COPY (
-            SELECT i.* FROM items i
-            WHERE i.perfume_id IN (SELECT DISTINCT perfume_id FROM kcore)
-        ) TO '{final / "items.parquet"}' (FORMAT PARQUET, COMPRESSION ZSTD)"""
+    _export_parquet(
+        con,
+        "SELECT i.* FROM items i WHERE i.perfume_id IN (SELECT DISTINCT perfume_id FROM kcore)",
+        final / "items.parquet",
     )
-    con.execute(
-        f"""COPY (
-            SELECT u.* EXCLUDE (username_slug, username_display),
+    _export_parquet(
+        con,
+        f"""SELECT u.* EXCLUDE (username_slug, username_display),
                    {hash_expr} AS user_hash
             FROM users u
-            WHERE u.member_id IN (SELECT DISTINCT member_id FROM kcore)
-        ) TO '{final / "users.parquet"}' (FORMAT PARQUET, COMPRESSION ZSTD)"""
+            WHERE u.member_id IN (SELECT DISTINCT member_id FROM kcore)""",
+        final / "users.parquet",
     )
 
     # Coleccion have/had/want: usuarios e items del catalogo crawleado, no
     # del k-core. El hash usa el mismo salt que interactions.
-    con.execute(
-        f"""COPY (
-            SELECT w.* EXCLUDE (username_slug),
+    _export_parquet(
+        con,
+        f"""SELECT w.* EXCLUDE (username_slug),
                    substr(sha256(w.username_slug || '{salt_sql}'), 1, 16) AS user_hash
             FROM wardrobe_dedup w
             JOIN items t USING (perfume_id)
             JOIN users u USING (member_id)
-            WHERE w.member_id IS NOT NULL
-        ) TO '{final / "wardrobe.parquet"}' (FORMAT PARQUET, COMPRESSION ZSTD)"""
+            WHERE w.member_id IS NOT NULL""",
+        final / "wardrobe.parquet",
     )
     rep.wardrobe_rows = con.execute(
         """
@@ -334,11 +377,11 @@ def consolidate(
     ).fetchone()[0]
 
     # El mapeo hash -> username queda aparte, fuera del dataset publicable.
-    con.execute(
-        f"""COPY (
-            SELECT DISTINCT member_id, username_slug, {hash_expr} AS user_hash
-            FROM users
-        ) TO '{final / "PRIVATE_user_mapping.parquet"}' (FORMAT PARQUET)"""
+    _export_parquet(
+        con,
+        f"""SELECT DISTINCT member_id, username_slug, {hash_expr} AS user_hash
+            FROM users""",
+        final / "PRIVATE_user_mapping.parquet",
     )
 
     rep.items_clean = con.execute("SELECT count(*) FROM items").fetchone()[0]
@@ -349,7 +392,6 @@ def consolidate(
     _write_dataset_card(final, rep, sensitivity, con, cfg)
     _print_report(rep, sensitivity)
 
-    con.close()
     return rep
 
 
@@ -423,6 +465,9 @@ def _write_dataset_card(
         "# Dataset card",
         "",
         "Generado por el scraper de Fragrantica. Uso academico.",
+        f"Export: {dt.datetime.now().isoformat(timespec='seconds')}.",
+        "Reejecutar `fragrantica phase 6` incorpora perfiles bajados despues;",
+        "no hace falta mezclar a mano con un parquet anterior.",
         "",
         "## Conteos",
         "",
@@ -488,6 +533,9 @@ def _write_dataset_card(
         "- **Sesgo de muestreo de usuarios**: el frontier de perfiles se puebla",
         "  desde las reviews encontradas, asi que los usuarios muy poco activos",
         "  estan subrepresentados (el k-core los eliminaria igual).",
+        "- **Export mientras corre la fase 3.** Este parquet es un snapshot de",
+        "  staging. Las reviews de pagina de perfume cuyo autor todavia no tiene",
+        "  perfil crawleado se descartan (sin member_id) hasta el proximo export.",
         "",
         "## Privacidad",
         "",

@@ -24,35 +24,36 @@ Documentos hermanos: [`PLAN.md`](PLAN.md) tiene el análisis del sitio y las
 decisiones de diseño con su justificación. [`README.md`](README.md) tiene el uso
 operativo. **Este archivo no los duplica**; se centra en estado y contexto.
 
-## Estado actual (última actualización: daemon continuo, jitter 7–10 s)
+## Estado actual (última actualización: items del slice enumerado done, fase 3 en curso)
 
-Se implementó el pipeline completo y un **vertical slice sobre Dior**. El
-crawl one-shot se cortaba en el primer interstitial; ahora el comando
-`fragrantica daemon` sigue solo (espera + un probe + reanuda).
+Se implementó el pipeline completo, el vertical slice sobre Dior y el crawl
+de las marcas enumeradas. El daemon está en **fase 3** (perfiles). La fase 2
+de perfume quedó vacía salvo 6 URLs `deferred` (cuarentena 12 h).
 
 ### Implementación: completa
 
 - Las 6 fases, el frontier reanudable, el cliente HTTP con impersonación TLS,
   los 3 parsers, la consolidación con k-core, el CLI y el **daemon**.
+- `fragrantica phase 6` lee el frontier en solo-lectura y puede correr en
+  paralelo al daemon: snapshot de staging, k-core, pisa `data/final/`.
 - Tests en verde (incluye consolidación, crypto AES, parser de shelves, watchdog).
 - `.gitignore` creado: `data/`, `.venv/`, caches. El mapeo privado no se versiona.
 
 ### Datos recolectados hasta ahora
 
-```
-frontier:  designer  1 done
-           perfume   268 done | 88 pending | 2 skipped
-           profile   ~13.7k pending      <-- fase 3 nunca corrió
-           member_ids: 0                 <-- consecuencia de lo anterior
-```
+Ver `fragrantica status`. Orden de magnitud reciente: ~18.5k perfumes `done`,
+~2k skipped (0 reviews), ~40k perfiles `done` y ~100k pending. El export en
+`data/final/` es un snapshot: reejecutar fase 6 suma los perfiles nuevos.
 
-Los pending de perfume son URLs que cayeron por 429/403/interstitial y
-volvieron a la cola. El daemon las retoma cuando el probe da 200.
+Los pending de perfume que quedaron son 6 `deferred` por interstitial (canario
+OK). El daemon no se traba ahí: saltó a fase 3.
 
 ### Qué falta
 
-1. Dejar corriendo `fragrantica daemon` (fase 2 → fase 3, sin apagarse).
-2. Cuando las colas estén vacías: fases 5 y 6; revisar `dataset_card.md`.
+1. Dejar corriendo `fragrantica daemon` hasta vaciar perfiles (y las 6 fichas
+   `deferred` cuando venza el backoff).
+2. Reejecutar `fragrantica phase 6` de a ratos para agrandar el dataset; fase 5
+   (huérfanos) recién cuando no compita con el GET de perfiles.
 3. Validar que el dataset entrena un ALS/LightFM.
 4. Recién entonces el catálogo completo: **una IP hogareña no alcanza**
    (~2M perfiles). Ahí hace falta `FRAGRANTICA_PROXY` residencial.

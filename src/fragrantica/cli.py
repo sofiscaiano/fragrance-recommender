@@ -143,11 +143,15 @@ def phase(
     staging, final, db = _paths(data_dir)
 
     async def run() -> None:
-        frontier = Frontier(db)
         if which == 6:
-            consolidate(staging, final, frontier, DATASET)
-            frontier.close()
+            # Solo lee member_ids; el daemon puede seguir escribiendo el WAL.
+            frontier = Frontier(db, readonly=True)
+            try:
+                consolidate(staging, final, frontier, DATASET)
+            finally:
+                frontier.close()
             return
+        frontier = Frontier(db)
         async with Client(CRAWL) as client:
             if which == 1:
                 await phase1_enumerate(

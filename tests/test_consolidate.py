@@ -314,6 +314,32 @@ def test_mixed_null_and_bigint_user_parquet_schema(tmp_path: Path) -> None:
     fr.close()
 
 
+def test_consolidate_with_readonly_frontier_and_overwrite(tmp_path: Path) -> None:
+    """La fase 6 lee member_ids en paralelo al daemon y pisa un final previo."""
+    staging, final = tmp_path / "staging", tmp_path / "final"
+    _write(staging, "items", [_item(1)])
+    _write(staging, "users", [_user(99, "alice")])
+    _write(staging, "interactions_from_perfume", [_inter(10, 1, "alice")])
+    w = Frontier(tmp_path / "f.db")
+    w.record_member_id("alice", 99)
+    w.close()
+
+    final.mkdir()
+    (final / "items.parquet").write_bytes(b"stale")
+    (final / "interactions.parquet").write_bytes(b"stale")
+
+    ro = Frontier(tmp_path / "f.db", readonly=True)
+    rep = consolidate(staging, final, ro, _cfg(k_core=1, sensitivity_k_values=(1,)))
+    ro.close()
+
+    assert rep.kcore_interactions == 1
+    items = pq.read_table(final / "items.parquet")
+    assert items.num_rows == 1
+    assert (final / "dataset_card.md").read_text().startswith("# Dataset card")
+    leftover = list((tmp_path / "_consolidate_work").glob("*")) if (tmp_path / "_consolidate_work").exists() else []
+    assert leftover == []
+
+
 def test_reset_rate_limited_clears_attempts(tmp_path: Path) -> None:
     fr = Frontier(tmp_path / "f.db")
     fr.add("https://x/1", "perfume", "1")

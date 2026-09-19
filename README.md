@@ -43,6 +43,13 @@ Todas son reanudables: reejecutar el mismo comando retoma donde quedó.
 .venv/bin/fragrantica phase 6                    # consolidar y exportar
 ```
 
+`phase 6` es local y **se puede correr con el daemon en fase 3**. Lee un
+snapshot de `staging/` más el mapa `slug → member_id`, aplica k-core y pisa
+`data/final/`. No hay que fusionar a mano el parquet viejo de Dior: esas
+filas ya están en staging. Reejecutar más tarde incorpora los perfiles
+bajados en el medio. Las reviews de perfume cuyo autor todavía no tiene
+perfil se descartan (sin `member_id`) hasta el próximo export.
+
 ### Monitoreo
 
 ```bash
