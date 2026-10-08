@@ -50,6 +50,29 @@ filas ya están en staging. Reejecutar más tarde incorpora los perfiles
 bajados en el medio. Las reviews de perfume cuyo autor todavía no tiene
 perfil se descartan (sin `member_id`) hasta el próximo export.
 
+### Proxy
+
+El daemon lee `FRAGRANTICA_PROXY` y `FRAGRANTICA_SHELVES_PROXY` al arrancar,
+una sola vez, al importar `CrawlConfig`. Hay que exportarlas en la misma
+shell, antes del proceso. Sin ellas, el HTML sale por la IP de la máquina.
+
+```bash
+export FRAGRANTICA_PROXY="http://user:pass@host:port"
+# opcional: solo el POST de wardrobe. Si falta, el POST usa la misma salida que el GET.
+export FRAGRANTICA_SHELVES_PROXY="http://user:pass@residencial:port"
+.venv/bin/fragrantica daemon
+```
+
+Varias URLs en la misma variable, separadas por coma, se eligen al azar al
+abrir cada sesión. Al arrancar, el daemon imprime cuántos proxies cargó; si
+no hay `FRAGRANTICA_PROXY`, avisa que el HTML va por la IP hogareña.
+
+`FRAGRANTICA_PROXY` es la salida de las páginas (fases 1–3 y 5).
+`FRAGRANTICA_SHELVES_PROXY` es solo el POST a `/ajax.php?user_shelves`. Con
+ese proxy aparte, el closet puede ir en paralelo al HTML. El catálogo
+completo no entra en una IP hogareña: ahí `FRAGRANTICA_PROXY` tiene que ser
+residencial.
+
 ### Monitoreo
 
 ```bash
@@ -75,6 +98,9 @@ snapshot de confianza.
 maple start --offline          # UI en http://127.0.0.1:4318
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
 export OTEL_SERVICE_NAME=fragrantica-scraper
+# opcional; ver la sección Proxy
+export FRAGRANTICA_PROXY="http://user:pass@host:port"
+export FRAGRANTICA_SHELVES_PROXY="http://user:pass@residencial:port"
 .venv/bin/fragrantica daemon
 ```
 
@@ -167,10 +193,8 @@ sostenida**, algo que un burst corto de prueba no detecta:
 | 1 worker, jitter 20–40 s + daemon | ~88 páginas OK; no duplicar workers |
 | 1 worker, jitter 7–10 s + daemon | default actual (~400 GETs `/perfume/` / IP) |
 
-`daemon` es el modo para terminar el slice: HTML por la IP hogareña,
-wardrobe por `FRAGRANTICA_SHELVES_PROXY` si está definido (residencial,
-solo el POST). El catálogo completo no entra en una IP hogareña; ahí
-`FRAGRANTICA_PROXY` tiene que ser residencial para las páginas.
+`daemon` es el modo para terminar el slice. Cómo enrutar HTML y wardrobe
+está en [Proxy](#proxy).
 
 ## Tests
 
