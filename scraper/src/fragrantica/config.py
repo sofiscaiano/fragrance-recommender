@@ -84,12 +84,15 @@ class CrawlConfig:
     cooldown_cap: float = field(default_factory=lambda: _env_float("FRAGRANTICA_COOLDOWN_CAP", 21600.0))
 
     # Capa 3 del plan: una IP nueva (hotspot o residencial) cuando Cloudflare
-    # penalizo la nuestra. Vacio = salir directo. Varias URLs separadas por coma.
+    # penalizo la nuestra. Vacio = salir directo. Varias URLs separadas por
+    # coma: cada una es un puerto sticky (una IP de salida). El cliente se
+    # queda en un puerto hasta que falla; no salta de IP en cada sesion.
     proxies: tuple[str, ...] = field(default_factory=lambda: _env_csv("FRAGRANTICA_PROXY"))
 
     # Solo el POST de wardrobe. Independiente de FRAGRANTICA_PROXY: si HTML
     # y ajax salen por la misma IP, el 70/19 se muda al residencial.
-    # Vacio = el POST usa la misma salida que el GET (casa o FRAGRANTICA_PROXY).
+    # Varias URLs de este pool rotan entre si ante un 429 de ajax; eso no
+    # quema los puertos del HTML. Vacio = el POST usa el mismo puerto que el GET.
     shelves_proxies: tuple[str, ...] = field(
         default_factory=lambda: _env_csv("FRAGRANTICA_SHELVES_PROXY")
     )

@@ -381,7 +381,10 @@ def daemon(
             "en FRAGRANTICA_SHELVES_PROXY[/cyan]"
         )
     if CRAWL.proxies:
-        console.print(f"[cyan]{len(CRAWL.proxies)} proxy(s) en FRAGRANTICA_PROXY[/cyan]")
+        console.print(
+            f"[cyan]{len(CRAWL.proxies)} proxy(s) en FRAGRANTICA_PROXY[/cyan] "
+            "[dim](un puerto hasta que falle; despues rota)[/dim]"
+        )
     else:
         console.print(
             "[dim]Sin FRAGRANTICA_PROXY. HTML por IP hogarena. "

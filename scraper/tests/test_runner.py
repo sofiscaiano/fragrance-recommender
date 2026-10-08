@@ -159,6 +159,81 @@ async def test_interstitial_stops_when_canary_fails(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_interstitial_rotates_when_another_port_is_free(tmp_path: Path) -> None:
+    """Canario falla y hay otro puerto: no es StopCrawl. La URL se vuelve a pedir."""
+    fr = Frontier(tmp_path / "f.db")
+    fr.add("https://x/poison", "perfume", "1")
+    writer = ParquetWriter(tmp_path, "dummy")
+
+    class _Switch:
+        def __init__(self) -> None:
+            self.fetches = 0
+            self.retired: list[str] = []
+
+        async def fetch(self, url: str, *, worker: int = 0, referer=None, kind="html"):
+            self.fetches += 1
+            if self.fetches == 1:
+                raise ChallengeDetected(f"HTTP 200 / interstitial en {url}")
+            return type("R", (), {"body": "<main fragrantica>"})()
+
+        async def canary_ok(self, *, worker: int = 0) -> bool:
+            return False
+
+        async def retire_egress(self, worker: int, reason: str, *, seconds=None) -> bool:
+            self.retired.append(reason)
+            return True
+
+    client = _Switch()
+    with writer:
+        stats = await run_phase(
+            name="test",
+            kind="perfume",
+            frontier=fr,
+            client=client,
+            writers={"dummy": writer},
+            handler=lambda *_: {},
+        )
+    row = fr.conn.execute(
+        "SELECT status FROM frontier WHERE url='https://x/poison'"
+    ).fetchone()
+    assert row["status"] == "done"
+    assert stats.done == 1
+    assert client.retired == ["challenge"]
+    assert client.fetches == 2
+    fr.close()
+
+
+@pytest.mark.asyncio
+async def test_canary_ok_does_not_retire_the_port(tmp_path: Path) -> None:
+    fr = Frontier(tmp_path / "f.db")
+    fr.add("https://x/poison", "perfume", "1")
+    writer = ParquetWriter(tmp_path, "dummy")
+
+    class _Keep:
+        async def fetch(self, url: str, *, worker: int = 0, referer=None, kind="html"):
+            raise ChallengeDetected(f"HTTP 200 / interstitial en {url}")
+
+        async def canary_ok(self, *, worker: int = 0) -> bool:
+            return True
+
+        async def retire_egress(self, worker: int, reason: str, *, seconds=None) -> bool:
+            raise AssertionError("el canario paso: el puerto sigue sirviendo")
+
+    with writer:
+        await run_phase(
+            name="test",
+            kind="perfume",
+            frontier=fr,
+            client=_Keep(),
+            writers={"dummy": writer},
+            handler=lambda *_: {},
+        )
+    row = fr.conn.execute("SELECT status FROM frontier").fetchone()
+    assert row["status"] == "deferred"
+    fr.close()
+
+
+@pytest.mark.asyncio
 async def test_ajax_429_does_not_stop_profile_phase(tmp_path: Path) -> None:
     """El GET del perfil se confirma done; el POST queda en shelves_jobs."""
     from fragrantica.http_client import FetchResult

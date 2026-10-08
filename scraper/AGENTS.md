@@ -258,14 +258,18 @@ Cuatro invariantes que **no hay que romper** al modificar el runner:
 2. **Los leases vencen.** `reclaim_stale()` devuelve a `pending` lo que quedó
    `in_progress` hace más de 15 min. Es lo que hace segura la recuperación de un
    `kill -9`.
-3. **El 429 de página en fase 2 corta el ciclo** (`requeue` + StopCrawl). En
-   fase 3 el GET de perfil hace cooldown de *esa* tarea (espera + probe) y
-   reanuda; el loop de shelves no se corta. Un 429 de ajax `/user_shelves`
-   tampoco: el job vuelve a `shelves_jobs` y el HTML ya es `done`. Con
-   `FRAGRANTICA_SHELVES_PROXY` el POST no comparte IP con el GET. Un
-   interstitial hace un canario (Sauvage, misma sesión): si pasa, la URL
-   va a `deferred` (12 h) y el lote sigue; si el canario también falla, el
-   GET entra en el mismo cooldown (fase 3) o StopCrawl (fase 2).
+3. **El 429 de página corta el ciclo solo si no queda otro puerto.** Con
+   varios proxies, el puerto que recibió el 429 entra en cooldown y el mismo
+   request sigue por el siguiente. `requeue` + StopCrawl queda para cuando el
+   pool está entero en cooldown, o no hay proxy. En fase 3 el GET de perfil
+   hace cooldown de *esa* tarea (espera + probe) y reanuda; el loop de shelves
+   no se corta. Un 429 de ajax `/user_shelves` tampoco quema la IP del HTML:
+   el job vuelve a `shelves_jobs` y el HTML ya es `done`. Si el ajax tiene
+   `FRAGRANTICA_SHELVES_PROXY` con varios puertos, rota dentro de ese pool.
+   Un interstitial hace un canario (Sauvage, misma sesión y mismo puerto): si
+   pasa, la URL va a `deferred` (12 h) y el puerto se conserva; si el canario
+   también falla y hay otro puerto, rota; si no, el GET entra en el mismo
+   cooldown (fase 3) o StopCrawl (fase 2).
 4. **La condición de salida mira `waiting_count()`, no solo `pending_count()`.**
    `pending_count` solo cuenta lo elegible *ya*; sin `waiting_count` el runner
    abandonaría los items diferidos por backoff. (Este bug existió y está

@@ -14,9 +14,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from curl_cffi import requests as cffi
 
@@ -36,10 +38,10 @@ class ChallengeDetected(Exception):
 class RateLimited(Exception):
     """HTTP 429: el sitio nos esta pidiendo explicitamente que bajemos el ritmo.
 
-    Se distingue del challenge a proposito. Un 403/interstitial es un problema
-    de fingerprint y se puede reintentar rapido; un 429 es el servidor diciendo
-    "sos demasiado" y reintentar pronto solo empeora las cosas y es descortes.
-    Merece una pausa global, no solo del worker que lo recibio.
+    Se distingue del challenge a proposito. Un 403/interstitial puede ser solo
+    esa URL (el canario lo distingue); un 429 es el cupo de esa IP. Con un
+    pool de puertos se enfria ese puerto y se sigue por otro. La pausa global
+    queda para cuando no queda ninguno libre, o cuando no hay proxy.
     """
 
     def __init__(self, message: str, retry_after: float | None = None) -> None:
@@ -53,6 +55,32 @@ class FetchError(Exception):
 
 class NotFound(Exception):
     """404 real: no vale reintentar."""
+
+
+# user:pass@ en un mensaje de curl no puede llegar al log ni al frontier.
+_PROXY_USERINFO = re.compile(r"://[^\s/@]+:[^\s/@]+@")
+
+
+def proxy_label(proxy: str) -> str:
+    """host:port, sin userinfo."""
+    parsed = urlparse(proxy)
+    host = parsed.hostname or "proxy"
+    if parsed.port:
+        return f"{host}:{parsed.port}"
+    return host
+
+
+def _redact(text: str) -> str:
+    return _PROXY_USERINFO.sub("://", text)
+
+
+def _retry_after(raw: str | None) -> float | None:
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 # El script de challenge de Cloudflare esta embebido en TODAS las paginas,
@@ -82,6 +110,14 @@ class FetchResult:
     status: int
     body: str
     elapsed: float
+
+
+@dataclass
+class _LiveSession:
+    session: cffi.AsyncSession
+    count: int
+    profile: str
+    proxy: str | None
 
 
 @dataclass(frozen=True)
@@ -130,7 +166,11 @@ class Client:
 
     def __init__(self, cfg: CrawlConfig = CRAWL) -> None:
         self.cfg = cfg
-        self._sessions: dict[int, tuple[cffi.AsyncSession, int, str]] = {}
+        self._sessions: dict[int, _LiveSession] = {}
+        # Puerto sticky por worker. Se enfria el que falla; no se rota en sano.
+        self._pin: dict[int, str] = {}
+        self._cooled: dict[str, dict[str, float]] = {"page": {}, "shelves": {}}
+        self._block_reason: dict[str, str] = {}
         self._outcomes: deque[bool] = deque(maxlen=cfg.challenge_window)
         self._paused_until = 0.0
         self._lock = asyncio.Lock()
@@ -147,14 +187,112 @@ class Client:
 
     # -- gestion de sesiones ------------------------------------------------
 
-    def _proxy_for(self, worker: int) -> str | None:
+    def _pool_for(self, worker: int) -> tuple[str, tuple[str, ...]]:
         if worker == SHELVES_WORKER and self.cfg.shelves_proxies:
-            return random.choice(self.cfg.shelves_proxies)
-        if self.cfg.proxies:
-            return random.choice(self.cfg.proxies)
-        return None
+            return "shelves", self.cfg.shelves_proxies
+        return "page", self.cfg.proxies
 
-    def _new_session(self, worker: int) -> tuple[cffi.AsyncSession, int, str]:
+    def _pin_worker(self, worker: int) -> int:
+        # Sin proxy propio, el POST de wardrobe sale por la misma IP que el GET.
+        # Un pin distinto abriria un segundo puerto y duplicaria el cupo.
+        if worker == SHELVES_WORKER and not self.cfg.shelves_proxies:
+            return 0
+        return worker
+
+    def _healthy(self, pool_name: str, pool: tuple[str, ...]) -> list[str]:
+        now = time.time()
+        cooled = self._cooled[pool_name]
+        fresh = [p for p in pool if cooled.get(p, 0) <= now]
+        # Los que nunca fallaron (0) van primero; despues el que lleva mas
+        # tiempo libre. El orden del config desempata, asi el pin es estable.
+        fresh.sort(key=lambda p: (cooled.get(p, 0), pool.index(p)))
+        return fresh
+
+    def _proxy_for(self, worker: int) -> str | None:
+        """Puerto sticky. Solo cambia cuando el actual esta en cooldown."""
+        pool_name, pool = self._pool_for(worker)
+        if not pool:
+            return None
+        pin_worker = self._pin_worker(worker)
+        current = self._pin.get(pin_worker)
+        now = time.time()
+        if current in pool and self._cooled[pool_name].get(current, 0) <= now:
+            return current
+        healthy = self._healthy(pool_name, pool)
+        if not healthy:
+            raise self._exhausted(pool_name)
+        pick = healthy[0]
+        self._pin[pin_worker] = pick
+        return pick
+
+    def _exhausted(self, pool_name: str) -> Exception:
+        """Ningun puerto libre. No caer a la IP de casa: tambien se quema."""
+        reason = self._block_reason.get(pool_name, "429")
+        which = "wardrobe" if pool_name == "shelves" else "paginas"
+        msg = f"todos los puertos del proxy de {which} en cooldown ({reason})"
+        if reason == "challenge":
+            return ChallengeDetected(msg)
+        return RateLimited(msg)
+
+    def _current_proxy(self, worker: int) -> str | None:
+        live = self._sessions.get(worker)
+        if live is not None and live.proxy:
+            return live.proxy
+        return self._pin.get(self._pin_worker(worker))
+
+    async def _drop_proxy(self, proxy: str) -> None:
+        for worker, live in list(self._sessions.items()):
+            if live.proxy != proxy:
+                continue
+            try:
+                await live.session.close()
+            except Exception:
+                pass
+            del self._sessions[worker]
+        for worker, pinned in list(self._pin.items()):
+            if pinned == proxy:
+                del self._pin[worker]
+
+    async def retire_egress(
+        self,
+        worker: int,
+        reason: str,
+        *,
+        seconds: float | None = None,
+    ) -> bool:
+        """Enfria el puerto actual. True si queda otro libre para seguir.
+
+        `reason` es `429`, `challenge` o `network`. Un solo puerto (o salida
+        directa) no rota: ahi manda la pausa del daemon. `seconds` pisa el
+        cooldown cuando el sitio manda un Retry-After mas largo.
+        """
+        pool_name, pool = self._pool_for(worker)
+        if len(pool) < 2:
+            return False
+        current = self._current_proxy(worker)
+        if not current or current not in pool:
+            return False
+        if seconds is None:
+            seconds = (
+                self.cfg.cooldown_challenge
+                if reason == "challenge"
+                else self.cfg.cooldown_429
+            )
+        self._cooled[pool_name][current] = time.time() + seconds
+        self._block_reason[pool_name] = reason
+        await self._drop_proxy(current)
+        healthy = self._healthy(pool_name, pool)
+        log.warning(
+            "proxy %s en cooldown %.0fs (%s); %d/%d puertos libres",
+            proxy_label(current),
+            seconds,
+            reason,
+            len(healthy),
+            len(pool),
+        )
+        return bool(healthy)
+
+    def _new_session(self, worker: int) -> _LiveSession:
         profile = random.choice(self.cfg.impersonate_profiles)
         proxy = self._proxy_for(worker)
         session = cffi.AsyncSession(
@@ -173,26 +311,24 @@ class Client:
                 "Sec-Fetch-Site": "same-origin",
             },
         )
-        log.debug(
-            "worker %d: sesion nueva con perfil %s%s",
-            worker,
-            profile,
-            " (shelves proxy)" if worker == SHELVES_WORKER and self.cfg.shelves_proxies else "",
-        )
-        return session, 0, profile
+        via = f" via {proxy_label(proxy)}" if proxy else ""
+        log.debug("worker %d: sesion nueva con perfil %s%s", worker, profile, via)
+        return _LiveSession(session=session, count=0, profile=profile, proxy=proxy)
 
     async def _session_for(self, worker: int) -> cffi.AsyncSession:
+        # El perfil TLS rota cada N requests. El puerto no: cambiar de IP con
+        # el cupo sano dispara interstitial en una IP recien usada.
         entry = self._sessions.get(worker)
-        if entry is None or entry[1] >= self.cfg.requests_per_session:
+        if entry is None or entry.count >= self.cfg.requests_per_session:
             if entry is not None:
                 try:
-                    await entry[0].close()
+                    await entry.session.close()
                 except Exception:
                     pass
             entry = self._new_session(worker)
-        session, count, profile = entry
-        self._sessions[worker] = (session, count + 1, profile)
-        return session
+        entry.count += 1
+        self._sessions[worker] = entry
+        return entry.session
 
     # -- circuit breaker ----------------------------------------------------
 
@@ -246,9 +382,18 @@ class Client:
         worker: int = 0,
         referer: str | None = None,
         kind: str = "html",
+        rotate: bool = True,
     ) -> FetchResult:
-        """GET. Una sola tentativa; el reintento lo maneja el frontier."""
-        return await self._request("GET", url, worker=worker, referer=referer, kind=kind)
+        """GET. El reintento de la URL lo maneja el frontier.
+
+        Si este puerto responde 429 o se cae la conexion y hay otro, se enfria
+        y el mismo GET sigue por ahi. Un interstitial sube tal cual: el canario
+        tiene que correr en esta sesion, no en una IP nueva. `rotate=False` es
+        ese canario: un 429 ahi no puede saltar de puerto y dar un falso OK.
+        """
+        return await self._request(
+            "GET", url, worker=worker, referer=referer, kind=kind, rotate=rotate,
+        )
 
     async def canary_ok(self, *, worker: int = 0) -> bool:
         """Sauvage por la misma sesion TLS. True = HTML real, no waiting room.
@@ -257,7 +402,7 @@ class Client:
         canario pasa y la URL del lote no, esa ficha va a cuarentena.
         """
         try:
-            await self.fetch(PROBE_URL, worker=worker)
+            await self.fetch(PROBE_URL, worker=worker, rotate=False)
             return True
         except ChallengeDetected:
             return False
@@ -284,14 +429,17 @@ class Client:
         referer: str | None,
         kind: str,
         data: dict[str, str] | None = None,
+        rotate: bool = True,
     ) -> FetchResult:
         if self.cfg.shelves_proxies:
             return await self._request_unlocked(
-                method, url, worker=worker, referer=referer, kind=kind, data=data
+                method, url, worker=worker, referer=referer, kind=kind, data=data,
+                rotate=rotate,
             )
         async with self._serial_io:
             return await self._request_unlocked(
-                method, url, worker=worker, referer=referer, kind=kind, data=data
+                method, url, worker=worker, referer=referer, kind=kind, data=data,
+                rotate=rotate,
             )
 
     async def _request_unlocked(
@@ -303,17 +451,21 @@ class Client:
         referer: str | None,
         kind: str,
         data: dict[str, str] | None = None,
+        rotate: bool = True,
     ) -> FetchResult:
-        """Una sola tentativa. El reintento lo maneja el frontier, no esta capa.
+        """Una tentativa por puerto. La URL fallida la reintenta el frontier.
 
-        Deliberado: si el retry viviera aca, un fallo persistente bloquearia el
-        worker. Dejando que el item vuelva al frontier con backoff, el worker
-        sigue con el siguiente y el fallido se reintenta despues.
+        429 y error de red son de este puerto: se enfria y se repite el mismo
+        request en el siguiente, con el jitter de siempre. El interstitial no
+        rota aca. Puede ser solo esta ficha, y el canario tiene que ver la
+        misma sesion TLS. Recien si el canario falla, el runner enfria el puerto.
         """
-        await self._respect_breaker(worker=worker)
-        await asyncio.sleep(random.uniform(self.cfg.delay_min, self.cfg.delay_max))
+        from .observability import classify_http, http_span, kind_from_url, record_http
 
-        session = await self._session_for(worker)
+        _, pool = self._pool_for(worker)
+        # Un intento por puerto. Si el ultimo tambien falla, retire devuelve
+        # False y la excepcion sale antes de agotar el for.
+        budget = max(1, len(pool))
         headers: dict[str, str] = {}
         if referer:
             headers["Referer"] = referer
@@ -324,77 +476,130 @@ class Client:
             headers["Sec-Fetch-Mode"] = "cors"
             headers["Sec-Fetch-Site"] = "same-origin"
 
-        from .observability import classify_http, http_span, kind_from_url, record_http
-
         metric_kind = kind_from_url(url, method=method)
-        started = time.monotonic()
-        with http_span(metric_kind, method):
+
+        for _ in range(budget):
+            await self._respect_breaker(worker=worker)
+            await asyncio.sleep(random.uniform(self.cfg.delay_min, self.cfg.delay_max))
             try:
-                if method == "POST":
-                    resp = await session.post(
-                        url, data=data or {}, headers=headers or None, allow_redirects=True,
+                session = await self._session_for(worker)
+            except (RateLimited, ChallengeDetected):
+                raise
+
+            started = time.monotonic()
+            with http_span(metric_kind, method):
+                try:
+                    if method == "POST":
+                        resp = await session.post(
+                            url, data=data or {}, headers=headers or None, allow_redirects=True,
+                        )
+                    else:
+                        resp = await session.get(
+                            url, headers=headers or None, allow_redirects=True,
+                        )
+                except Exception as exc:
+                    outcome, status = classify_http(0, network_error=True)
+                    record_http(
+                        metric_kind, outcome, time.monotonic() - started, status=status,
                     )
-                else:
-                    resp = await session.get(url, headers=headers or None, allow_redirects=True)
-            except Exception as exc:
-                self._record(False)
-                outcome, status = classify_http(0, network_error=True)
-                record_http(metric_kind, outcome, time.monotonic() - started, status=status)
-                raise FetchError(f"error de red en {url}: {exc}") from exc
-            elapsed = time.monotonic() - started
-
-            body = resp.text or ""
-
-            if resp.status_code == 404:
-                self._record(True)  # 404 es una respuesta valida, no un bloqueo
-                outcome, status = classify_http(404)
-                record_http(metric_kind, outcome, elapsed, status=status)
-                raise NotFound(url)
-
-            if resp.status_code == 429:
-                self._record(False)
-                retry_after = None
-                raw = resp.headers.get("Retry-After")
-                if raw:
-                    try:
-                        retry_after = float(raw)
-                    except ValueError:
-                        retry_after = None
-                # pause_all es para 429 de pagina (ritmo de IP). En ajax el cupo
-                # es del endpoint: frenar el HTML 5 min recreaba el 70/19.
-                if kind != "json":
-                    self.pause_all(
-                        retry_after or self.cfg.rate_limit_pause, f"HTTP 429 en {url}"
+                    switched = (
+                        rotate
+                        and self._can_rotate_network(worker)
+                        and await self.retire_egress(worker, "network")
                     )
-                outcome, status = classify_http(429)
-                record_http(metric_kind, outcome, elapsed, status=status)
-                raise RateLimited(f"HTTP 429 en {url}", retry_after)
+                    if switched:
+                        continue
+                    self._record(False)
+                    detail = _redact(str(exc))
+                    # Con pool, un corte en todos los puertos no es culpa de la
+                    # URL: RateLimited no le suma intentos en el frontier.
+                    if rotate and len(pool) >= 2:
+                        raise RateLimited(
+                            f"todos los puertos del proxy fallaron al conectar: {detail}"
+                        ) from None
+                    raise FetchError(f"error de red en {url}: {detail}") from None
 
-            interstitial = looks_like_challenge(body, kind=kind)
-            if resp.status_code in (403, 503) or interstitial:
-                self._record(False)
-                outcome, status = classify_http(
-                    resp.status_code, interstitial=interstitial
+                elapsed = time.monotonic() - started
+                body = resp.text or ""
+
+                if resp.status_code == 404:
+                    self._record(True)  # 404 es una respuesta valida, no un bloqueo
+                    outcome, status = classify_http(404)
+                    record_http(metric_kind, outcome, elapsed, status=status)
+                    raise NotFound(url)
+
+                if resp.status_code == 429:
+                    outcome, status = classify_http(429)
+                    record_http(metric_kind, outcome, elapsed, status=status)
+                    retry_after = _retry_after(resp.headers.get("Retry-After"))
+                    switched = (
+                        rotate
+                        and self._can_rotate_429(worker, kind)
+                        and await self.retire_egress(
+                            worker,
+                            "429",
+                            seconds=max(self.cfg.cooldown_429, retry_after or 0),
+                        )
+                    )
+                    if switched:
+                        # El breaker no cuenta este 429: es la IP vieja, no la nueva.
+                        continue
+                    self._record(False)
+                    # pause_all es para 429 de pagina (ritmo de IP). En ajax el
+                    # cupo es del endpoint: frenar el HTML 5 min recreaba el 70/19.
+                    if kind != "json":
+                        self.pause_all(
+                            retry_after or self.cfg.rate_limit_pause,
+                            f"HTTP 429 en {url}",
+                        )
+                    raise RateLimited(f"HTTP 429 en {url}", retry_after)
+
+                interstitial = looks_like_challenge(body, kind=kind)
+                if resp.status_code in (403, 503) or interstitial:
+                    self._record(False)
+                    outcome, status = classify_http(
+                        resp.status_code, interstitial=interstitial
+                    )
+                    record_http(metric_kind, outcome, elapsed, status=status)
+                    raise ChallengeDetected(
+                        f"HTTP {resp.status_code} / interstitial en {url}"
+                    )
+
+                if resp.status_code >= 500:
+                    # 5xx del origen: rotar de IP multiplica la carga y no
+                    # cambia la respuesta. 503 ya cayo en el branch de challenge.
+                    self._record(True)
+                    outcome, status = classify_http(resp.status_code)
+                    record_http(metric_kind, outcome, elapsed, status=status)
+                    raise FetchError(f"HTTP {resp.status_code} en {url}")
+
+                if resp.status_code != 200:
+                    self._record(True)
+                    outcome, status = classify_http(resp.status_code)
+                    record_http(metric_kind, outcome, elapsed, status=status)
+                    raise FetchError(f"HTTP inesperado {resp.status_code} en {url}")
+
+                self._record(True)
+                outcome, status = classify_http(200)
+                record_http(metric_kind, outcome, elapsed, status=status)
+                return FetchResult(
+                    url=url, status=resp.status_code, body=body, elapsed=elapsed,
                 )
-                record_http(metric_kind, outcome, elapsed, status=status)
-                raise ChallengeDetected(f"HTTP {resp.status_code} / interstitial en {url}")
 
-            if resp.status_code >= 500:
-                self._record(True)
-                outcome, status = classify_http(resp.status_code)
-                record_http(metric_kind, outcome, elapsed, status=status)
-                raise FetchError(f"HTTP {resp.status_code} en {url}")
+        raise RateLimited(f"HTTP 429 en {url}")
 
-            if resp.status_code != 200:
-                self._record(True)
-                outcome, status = classify_http(resp.status_code)
-                record_http(metric_kind, outcome, elapsed, status=status)
-                raise FetchError(f"HTTP inesperado {resp.status_code} en {url}")
+    def _can_rotate_429(self, worker: int, kind: str) -> bool:
+        """El 429 de ajax en la IP del HTML no quema ese puerto.
 
-            self._record(True)
-            outcome, status = classify_http(200)
-            record_http(metric_kind, outcome, elapsed, status=status)
-            return FetchResult(url=url, status=resp.status_code, body=body, elapsed=elapsed)
+        Medido: el cupo de `/user_shelves` no es el de las paginas. Rotarlo
+        tiraria una IP que todavia sirve para perfiles.
+        """
+        if kind == "json" and worker == SHELVES_WORKER and not self.cfg.shelves_proxies:
+            return False
+        return len(self._pool_for(worker)[1]) >= 2
+
+    def _can_rotate_network(self, worker: int) -> bool:
+        return len(self._pool_for(worker)[1]) >= 2
 
     async def ensure_passphrase(self, sample_html: str = "", *, worker: int = 0) -> str | None:
         """Passphrase AES = `_pd(hostname)`. Cero GET extra al bundle.
@@ -488,9 +693,9 @@ class Client:
         return True
 
     async def close(self) -> None:
-        for session, _, _ in self._sessions.values():
+        for live in self._sessions.values():
             try:
-                await session.close()
+                await live.session.close()
             except Exception:
                 pass
         self._sessions.clear()

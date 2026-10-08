@@ -7,8 +7,10 @@ sin sentarse a esperar el probe a mano:
     trabajo -> StopCrawl -> espera exponencial -> UN probe -> si 200, sigue
 
 La espera crece (429: 5 min, 10, 20…; challenge: 30 min, 1 h, 2 h; tope 6 h)
-porque reanudar en caliente es lo que convirtio el 429 en bloqueo de IP. Un
-probe por ciclo, nunca un retry inmediato de la URL que fallo.
+porque reanudar en caliente es lo que convirtio el 429 en bloqueo de IP. Con
+varios puertos en FRAGRANTICA_PROXY esa espera solo arranca cuando no queda
+ninguno libre: el puerto que fallo se enfria y el crawl sigue por otro.
+Un probe por ciclo, nunca un retry inmediato de la URL que fallo.
 """
 
 from __future__ import annotations

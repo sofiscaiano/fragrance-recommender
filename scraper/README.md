@@ -63,9 +63,20 @@ export FRAGRANTICA_SHELVES_PROXY="http://user:pass@residencial:port"
 .venv/bin/fragrantica daemon
 ```
 
-Varias URLs en la misma variable, separadas por coma, se eligen al azar al
-abrir cada sesión. Al arrancar, el daemon imprime cuántos proxies cargó; si
-no hay `FRAGRANTICA_PROXY`, avisa que el HTML va por la IP hogareña.
+Varias URLs en la misma variable, separadas por coma. Cada una tiene que ser
+un puerto sticky (una IP de salida distinta). El proceso se queda en el
+primero mientras responda: no salta de IP al renovar la sesión TLS, porque
+una IP nueva con el ritmo de crawl dispara el interstitial.
+
+Si ese puerto responde 429 o se cae la conexión, entra en cooldown y el mismo
+request sigue por el siguiente. Un interstitial prueba el canario en el mismo
+puerto: si pasa, la ficha va a cuarentena y el puerto se conserva; si el
+canario también falla, rota. La espera del daemon solo corre cuando no queda
+ningún puerto libre. Sin proxy configurado no hay caída a otra salida: la IP
+de la máquina sigue como hasta ahora.
+
+Al arrancar, el daemon imprime cuántos proxies cargó; si no hay
+`FRAGRANTICA_PROXY`, avisa que el HTML va por la IP hogareña.
 
 `FRAGRANTICA_PROXY` es la salida de las páginas (fases 1–3 y 5).
 `FRAGRANTICA_SHELVES_PROXY` es solo el POST a `/ajax.php?user_shelves`. Con
@@ -125,11 +136,14 @@ El estado del crawl vive en `data/frontier.db`, commiteado transaccionalmente.
   lease (15 min por defecto).
 - **Un item falla**: no bloquea la cola. Pasa a `failed` con backoff exponencial
   y vuelve a ser elegible solo. Después de 6 intentos cae a `dead` y se reporta.
-- **HTTP 429**: `phase` se detiene (exit 2). El daemon espera, un probe, y reanuda.
-- **Interstitial**: canario a Sauvage **en la misma sesión**. Si el canario
-  pasa, esa URL va a `deferred` (reintento en 12 h) y el lote sigue. Si el
-  canario también falla, se corta igual que el 429. Para arrancar sin heredar
-  esa espera: `fragrantica clear-cooldown` o borrar `data/daemon_state.json`.
+- **HTTP 429**: si hay otro puerto en `FRAGRANTICA_PROXY`, ese entra en
+  cooldown y el crawl sigue. Si no queda ninguno (o no hay proxy), `phase` se
+  detiene (exit 2). El daemon espera, un probe, y reanuda.
+- **Interstitial**: canario a Sauvage **en la misma sesión y el mismo puerto**.
+  Si el canario pasa, esa URL va a `deferred` (reintento en 12 h) y el puerto
+  se queda. Si el canario también falla y hay otro puerto, rota. Si no, se
+  corta igual que el 429. Para arrancar sin heredar esa espera:
+  `fragrantica clear-cooldown` o borrar `data/daemon_state.json`.
 - **`kill -9` o corte de luz**: igual que Ctrl-C. Nunca hay estado crítico solo
   en memoria, y las escrituras a Parquet son atómicas (`.tmp` + rename).
 

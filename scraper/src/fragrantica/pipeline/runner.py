@@ -49,15 +49,32 @@ console = Console()
 
 
 class StopCrawl(Exception):
-    """429 o interstitial: se corta este ciclo. El daemon espera y reanuda.
+    """429 o interstitial sin otro puerto libre: se corta este ciclo.
 
     Seguir pidiendo en caliente es lo que pasa de rate-limit a penalizacion
     de IP. La URL vuelve a la cola; `fragrantica daemon` hace el probe.
+    Si quedaba otro puerto, el runner no corta: enfria este y sigue.
     """
 
     def __init__(self, message: str, *, reason: str = "challenge") -> None:
         super().__init__(message)
         self.reason = reason
+
+
+async def _switch_port(client: object, worker: int, reason: str) -> bool:
+    """True si el cliente enfrio este puerto y tiene otro. Los fakes no rotan."""
+    retire = getattr(client, "retire_egress", None)
+    if retire is None:
+        return False
+    switched = retire(worker, reason)
+    if asyncio.iscoroutine(switched):
+        switched = await switched
+    return bool(switched)
+
+
+def _note_port_switch() -> None:
+    log.warning("puerto de proxy en cooldown; el crawl sigue por otro")
+    console.print("[yellow]Puerto en cooldown[/yellow] (sigo por otro)")
 
 
 class SkipItem(Exception):
@@ -201,21 +218,29 @@ async def run_phase(
             frontier.mark_skipped(url, str(exc))
             stats.skipped += 1
         except RateLimited as exc:
-            # 429 de pagina: no es culpa de esta URL. Vuelve a pending y se
-            # CORTA el ciclo. El 429 de ajax lo traga `_shelves_for_profile`
-            # (pausa los POST, el HTML se confirma done). Pausar 5 min y
-            # seguir en caliente era lo que escalaba a 403 de IP.
+            # 429 de pagina: no es culpa de esta URL. El cliente ya roto de
+            # puerto si habia otro libre; si esto sube, no queda ninguno
+            # (o no hay proxy). Vuelve a pending y se CORTA el ciclo. El 429
+            # de ajax lo traga `_shelves_for_profile`. Pausar 5 min y seguir
+            # en la misma IP era lo que escalaba a 403.
             frontier.requeue(url, str(exc), delay=exc.retry_after or cfg.rate_limit_pause)
             stats.rate_limited += 1
             halt = StopCrawl("HTTP 429: el sitio pidio bajar el ritmo", reason="429")
         except ChallengeDetected as exc:
             # Un interstitial puede ser la IP o esa URL. El canario (Sauvage)
-            # va por la misma sesion: si pasa, cuarentena y el lote sigue;
-            # si tambien falla, StopCrawl (no martillar).
+            # va por la misma sesion: si pasa, cuarentena y el puerto se queda.
+            # Si tambien falla, esa IP esta quemada: otro puerto sigue; si no
+            # hay, StopCrawl (no martillar la misma salida).
             if url.rstrip("/") == PROBE_URL.rstrip("/"):
-                frontier.requeue(url, str(exc), delay=cfg.rate_limit_pause)
-                stats.failed += 1
-                halt = StopCrawl(f"bloqueado por Cloudflare ({exc})", reason="challenge")
+                if await _switch_port(client, worker, "challenge"):
+                    frontier.requeue(url, str(exc), delay=0)
+                    _note_port_switch()
+                else:
+                    frontier.requeue(url, str(exc), delay=cfg.rate_limit_pause)
+                    stats.failed += 1
+                    halt = StopCrawl(
+                        f"bloqueado por Cloudflare ({exc})", reason="challenge"
+                    )
             else:
                 try:
                     canary_fn = getattr(client, "canary_ok", None)
@@ -227,12 +252,18 @@ async def run_phase(
                             canary = True
                         except ChallengeDetected:
                             canary = False
-                except RateLimited:
-                    frontier.requeue(url, str(exc), delay=cfg.rate_limit_pause)
-                    stats.rate_limited += 1
-                    halt = StopCrawl(
-                        "HTTP 429: el sitio pidio bajar el ritmo", reason="429"
-                    )
+                except RateLimited as limited:
+                    if await _switch_port(client, worker, "429"):
+                        frontier.requeue(url, str(limited), delay=0)
+                        _note_port_switch()
+                    else:
+                        frontier.requeue(
+                            url, str(limited), delay=limited.retry_after or cfg.rate_limit_pause,
+                        )
+                        stats.rate_limited += 1
+                        halt = StopCrawl(
+                            "HTTP 429: el sitio pidio bajar el ritmo", reason="429"
+                        )
                 else:
                     if canary:
                         frontier.mark_deferred(url, str(exc), cfg.quarantine_seconds)
@@ -246,6 +277,9 @@ async def run_phase(
                             f"[yellow]Cuarentena[/yellow] {url} "
                             f"(canario OK; reintento en {cfg.quarantine_seconds / 3600:.0f}h)"
                         )
+                    elif await _switch_port(client, worker, "challenge"):
+                        frontier.requeue(url, str(exc), delay=0)
+                        _note_port_switch()
                     else:
                         frontier.requeue(url, str(exc), delay=cfg.rate_limit_pause)
                         stats.failed += 1
