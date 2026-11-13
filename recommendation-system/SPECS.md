@@ -1,39 +1,35 @@
 # Contrato del experimento
 
-El sistema predice, para cada usuario, las próximas reviews y el orden según la nota que les va a poner.
+El sistema predice, para cada usuario, las próximas reviews y el orden según la nota que les va a poner. El modelo es el prototipo de dos etapas: retrieval, fusión por Reciprocal Rank Fusion y LambdaRank.
 
 ## Datos
 
-Entran solo las reviews con fecha y rating de `scraper/data/final/interactions.parquet`. Los votos no tienen fecha y no entran. El wardrobe no se usa.
+Entran solo las reviews con fecha y rating de `scraper/data/final/interactions.parquet`, y el catálogo de `items.parquet`. Los votos no tienen fecha y no entran. El wardrobe no se usa. No hay género ni año de nacimiento del usuario: esas columnas del ranker quedan vacías.
 
 ## Matriz
 
-Primero se arma la matriz. El corte activo está en `config.py` (`ACTIVE_CUT`). Los tres cortes disponibles son 28/60, 22/80 y 30/60: mínimo de reviews por usuario y por perfume, iterando hasta que nadie más cae del piso.
+Primero se arma la matriz. El corte activo está en `fragrantica_rec/config.py` (`ACTIVE_CUT`). Los tres cortes disponibles son 28/60, 22/80 y 30/60: mínimo de reviews por usuario y por perfume, iterando hasta que nadie más cae del piso.
 
-Ese piso se calcula con todas las reviews de la matriz, también las que después se esconden. La popularidad, los embeddings y cualquier agregado de una review se calculan solo con train.
+Ese piso se calcula con todas las reviews de la matriz, también las que después se esconden. Cada fuente y el ranker se ajustan solo con el historial anterior a su corte.
 
 ## Split
 
 Sobre la matriz ya filtrada, por usuario y por fecha:
 
-- las últimas 10 reviews son test
-- las 10 anteriores son validación
-- el resto es train
+- las últimas 10 reviews son el holdout, y son la evaluación
+- dentro de lo anterior, tres folds rolling de horizonte 10 y mínimo de historia 5 entrenan el ranker
+- el último fold es la validación del early stopping y de Optuna
 
-El test se escribe en `splits/test.parquet` y no se lee. No hay script que lo mida.
+No hay un test sellado aparte. Esas 10 interacciones se miden.
 
 ## Métrica
 
-La selección es NDCG@10. La relevancia es la nota. La ganancia es `2^nota - 1`, descontada por `log2(posición + 1)`. Se promedia un valor por usuario, contra el catálogo completo menos lo que ya reseñó en train.
+La selección es NDCG@10. La relevancia es la nota, de 1 a 5. La ganancia es `2^nota - 1`. Un positivo que el retrieval no trajo penaliza el NDCG. Se promedia un valor por usuario.
 
-Acompañan Recall@10 y la cobertura del catálogo en el top 10. Esas tres se calculan solo en validación.
+## Modelo
 
-## Modelos
+Las fuentes de candidatos, en este orden, son popularidad, coseno ítem-ítem, ALS, BPR, TF-IDF, two-tower y EASE. La fusión es Reciprocal Rank Fusion y se queda con un prefijo. LambdaRank ordena ese prefijo.
 
-Los cuatro baselines corren siempre: popularidad con decaimiento temporal, EASE, item-kNN y ALS implícito. El two-tower es un solo modelo: el score es el producto interno y con eso se ordena el catálogo. La loss es implícita y el peso de cada positivo es la misma ganancia, `2^nota - 1`. `two_tower` usa el contenido del perfume. `two_tower_id` usa solo el id.
+La marca ocupa el lugar del autor y la familia olfativa el del género: son una sola etiqueta por perfume. Perfumistas, accords, notas, género del perfume, nombre y descripción entran solo al texto del TF-IDF. La confianza de ALS, BPR, coseno y TF-IDF es `1 + rating / 5`.
 
-Un modelo nuevo entra por `run.py`, con el mismo train, la misma validación y las mismas métricas. Se queda el de mejor NDCG@10 de validación. Cada corrida queda en MLflow, sin métricas de test.
-
-Los hiperparámetros de partida están en `config.py`. `tune.py` elige por NDCG@10 de validación y escribe el corte activo en `chosen.json`. La corrida siguiente usa esos valores.
-
-`config.BASELINE` es el piso del reporte. `run.py` lo entrena si no está en `MODELS` y muestra la diferencia de cada modelo contra sus métricas de validación. La decisión del ranker usa solo los baselines que corrieron dentro de `MODELS`.
+`main.py evaluate` corre el holdout. `--tune` busca con Optuna y escribe `artifacts/`. Sin `--tune`, two_stage reutiliza un tuneo de la misma config. No hay lista de entrega: Optuna puntúa a todos los usuarios del último fold.

@@ -3,8 +3,8 @@ import json
 import numpy as np
 import pandas as pd
 
-import config
-from data import filtered_matrix
+from fragrantica_rec import config
+from fragrantica_rec.data import filtered_matrix
 
 REVIEW_COLUMNS = [
     "member_id",

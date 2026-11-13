@@ -1,0 +1,455 @@
+"""Configuración serializable del recomendador."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT.parent / "scraper" / "data" / "final"
+REPORTS_DIR = ROOT / "reports"
+ARTIFACTS_DIR = ROOT / "artifacts"
+
+# Mínimo de reviews por usuario y por perfume. El corte activo es el de la matriz.
+CUTS = {
+    "28_60": {"min_user": 28, "min_item": 60},
+    "22_80": {"min_user": 22, "min_item": 80},
+    "30_60": {"min_user": 30, "min_item": 60},
+}
+ACTIVE_CUT = "28_60"
+
+
+@dataclass(frozen=True)
+class SearchRange:
+    """Intervalo que Optuna recorre para un hiperparámetro."""
+
+    low: float
+    high: float
+    log: bool = False
+    integer: bool = False
+
+    def suggest(self, trial: Any, name: str) -> float | int:
+        """Pide a Optuna un entero o un float dentro de este intervalo."""
+
+        if self.integer:
+            return trial.suggest_int(name, int(self.low), int(self.high), log=self.log)
+        return trial.suggest_float(name, self.low, self.high, log=self.log)
+
+
+def search_ranges(search: Any) -> dict[str, SearchRange]:
+    """Campos de un bloque `search`, en el orden de la clase."""
+
+    return {item.name: getattr(search, item.name) for item in fields(search)}
+
+
+@dataclass(frozen=True)
+class SplitConfig:
+    """Parámetros del holdout y del backtesting temporal."""
+
+    holdout_k: int = 10
+    rolling_folds: int = 3
+    rolling_horizon: int = 10
+    min_history: int = 5
+
+
+@dataclass(frozen=True)
+class RetrievalSearch:
+    """Hiperparámetros de fusión que Optuna recorre."""
+
+    rrf_cutoff: SearchRange = field(
+        default_factory=lambda: SearchRange(100, 1000, log=True, integer=True)
+    )
+    source_weight: SearchRange = field(
+        default_factory=lambda: SearchRange(0.1, 3.0, log=True)
+    )
+
+    def __post_init__(self) -> None:
+        low = int(self.rrf_cutoff.low)
+        high = int(self.rrf_cutoff.high)
+        if low < 1 or low > high:
+            raise ValueError("la búsqueda de rrf_cutoff debe ser un intervalo positivo")
+        if self.source_weight.low < 0:
+            raise ValueError("la búsqueda de source_weight no admite pesos negativos")
+
+
+@dataclass(frozen=True)
+class RetrievalConfig:
+    """Fuentes de candidatos. El corte y los pesos salen de un `--tune` con esta config.
+
+    Optuna recorre `search`. Sin `--tune`, la corrida busca en
+    `artifacts/tuning_history.json` una entrada con la misma config. Si no hay,
+    hay que correr `evaluate --tune`: esta clase no guarda un corte ni unos
+    pesos para usar por descuido.
+
+    Cada `*_source` decide si esa fuente se entrena. Un peso del tuneo solo
+    pondera las que quedan activas: un peso no la enciende. Una fuente activa
+    sin peso en el tuneo guardado hace fallar la corrida.
+
+    Los hiperparámetros de cada fuente no viven acá. Salen del JSON de esa
+    fuente, o de su config si el archivo no existe. `recency_half_life_days`
+    es solo la semivida con la que EASE puntúa: su study no la busca.
+    """
+
+    rrf_k: float = 60.0  # valor estandar
+    recency_half_life_days: float = 365.0
+    popularidad_source: bool = True
+    item_cosine_source: bool = True
+    als_source: bool = True
+    bpr_source: bool = True
+    tfidf_source: bool = True
+    two_tower_source: bool = True
+    ease_source: bool = True
+    search: RetrievalSearch = field(default_factory=RetrievalSearch)
+
+    def enabled_sources(self) -> tuple[str, ...]:
+        """Nombres de las fuentes que esta config entrena, en orden fijo."""
+
+        flags = (
+            ("popularidad", self.popularidad_source),
+            ("item_cosine", self.item_cosine_source),
+            ("als", self.als_source),
+            ("bpr", self.bpr_source),
+            ("tfidf", self.tfidf_source),
+            ("two_tower", self.two_tower_source),
+            ("ease", self.ease_source),
+        )
+        return tuple(name for name, enabled in flags if enabled)
+
+    def __post_init__(self) -> None:
+        if self.rrf_k <= 0:
+            raise ValueError("rrf_k debe ser positivo")
+        if not self.enabled_sources():
+            raise ValueError("al menos una fuente de retrieval tiene que estar activa")
+
+
+@dataclass(frozen=True)
+class RankerSearch:
+    """Hiperparámetros de LambdaRank que Optuna recorre."""
+
+    learning_rate: SearchRange = field(
+        default_factory=lambda: SearchRange(0.015, 0.12, log=True)
+    )
+    num_leaves: SearchRange = field(
+        default_factory=lambda: SearchRange(15, 127, log=True, integer=True)
+    )
+    max_depth: SearchRange = field(
+        default_factory=lambda: SearchRange(4, 12, integer=True)
+    )
+    min_child_samples: SearchRange = field(
+        default_factory=lambda: SearchRange(10, 100, integer=True)
+    )
+    subsample: SearchRange = field(default_factory=lambda: SearchRange(0.65, 1.0))
+    colsample_bytree: SearchRange = field(
+        default_factory=lambda: SearchRange(0.6, 1.0)
+    )
+    reg_alpha: SearchRange = field(
+        default_factory=lambda: SearchRange(1e-8, 10.0, log=True)
+    )
+    reg_lambda: SearchRange = field(
+        default_factory=lambda: SearchRange(1e-8, 20.0, log=True)
+    )
+
+
+LABEL_GAIN_MODES = ("linear", "exponential")
+
+
+@dataclass(frozen=True)
+class EaseSearch:
+    """Hiperparámetros que recorre el study de `--model ease`.
+
+    `two_stage` no los busca. La fuente usa el JSON de EASE o estos valores,
+    y Optuna solo elige el peso de esa lista en la fusión. La recencia del
+    perfil no entra: sale de `RetrievalConfig.recency_half_life_days`.
+    """
+
+    reg_lambda: SearchRange = field(
+        default_factory=lambda: SearchRange(100.0, 100_000.0, log=True)
+    )
+    min_interactions: SearchRange = field(
+        default_factory=lambda: SearchRange(10, 100, log=True, integer=True)
+    )
+
+
+@dataclass(frozen=True)
+class EaseConfig:
+    """λ y el mínimo de lecturas de EASE, si no hay un JSON guardado.
+
+    La matriz siempre lleva el rating. Al puntuar, ese rating se multiplica
+    por la recencia (`RetrievalConfig.recency_half_life_days`). El study no
+    elige esa semivida. Con `retrieval.ease_source`, two_stage arma la misma
+    matriz: el JSON de un tuneo de EASE gana y no lo pisa.
+    """
+
+    reg_lambda: float = 15_000.0
+    min_interactions: int = 20
+    search: EaseSearch = field(default_factory=EaseSearch)
+
+    def __post_init__(self) -> None:
+        if self.reg_lambda <= 0:
+            raise ValueError("reg_lambda debe ser positivo")
+        if self.min_interactions < 1:
+            raise ValueError("min_interactions debe ser positivo")
+
+
+@dataclass(frozen=True)
+class ItemCosineSearch:
+    """Semivida que recorre el study de `--model item_cosine`."""
+
+    half_life_days: SearchRange = field(
+        default_factory=lambda: SearchRange(30, 1095, log=True)
+    )
+
+
+@dataclass(frozen=True)
+class ItemCosineConfig:
+    """Semivida del coseno ítem-ítem, si no hay un JSON guardado.
+
+    El modo centrado en la media del lector quedó afuera. `two_stage` no
+    vuelve a buscar esta semivida: lee el JSON o este valor, y solo elige el peso.
+    """
+
+    half_life_days: float = 365.0
+    search: ItemCosineSearch = field(default_factory=ItemCosineSearch)
+
+    def __post_init__(self) -> None:
+        if self.half_life_days <= 0:
+            raise ValueError("half_life_days debe ser positivo")
+
+
+@dataclass(frozen=True)
+class AlsSearch:
+    """Hiperparámetros que recorre el study de `--model als`."""
+
+    factors: SearchRange = field(
+        default_factory=lambda: SearchRange(16, 256, log=True, integer=True)
+    )
+    iterations: SearchRange = field(
+        default_factory=lambda: SearchRange(5, 40, integer=True)
+    )
+    regularization: SearchRange = field(
+        default_factory=lambda: SearchRange(1e-3, 10.0, log=True)
+    )
+    half_life_days: SearchRange = field(
+        default_factory=lambda: SearchRange(30, 1095, log=True)
+    )
+
+
+@dataclass(frozen=True)
+class AlsConfig:
+    """Factores, pasos, regularización y semivida de ALS, sin un JSON guardado.
+
+    `regularization` arranca en 0,01, el defecto de implicit. No se busca
+    `alpha`: la confianza ya es `(1 + rating / 5)` por la recencia.
+    """
+
+    factors: int = 64
+    iterations: int = 20
+    regularization: float = 0.01
+    half_life_days: float = 365.0
+    search: AlsSearch = field(default_factory=AlsSearch)
+
+    def __post_init__(self) -> None:
+        if min(self.factors, self.iterations) < 1:
+            raise ValueError("factors e iterations deben ser positivos")
+        if self.regularization <= 0 or self.half_life_days <= 0:
+            raise ValueError("regularization y half_life_days deben ser positivos")
+
+
+@dataclass(frozen=True)
+class BprSearch:
+    """Hiperparámetros que recorre el study de `--model bpr`."""
+
+    factors: SearchRange = field(
+        default_factory=lambda: SearchRange(16, 256, log=True, integer=True)
+    )
+    iterations: SearchRange = field(
+        default_factory=lambda: SearchRange(10, 100, integer=True)
+    )
+    learning_rate: SearchRange = field(
+        default_factory=lambda: SearchRange(1e-3, 0.1, log=True)
+    )
+    regularization: SearchRange = field(
+        default_factory=lambda: SearchRange(1e-4, 1.0, log=True)
+    )
+    half_life_days: SearchRange = field(
+        default_factory=lambda: SearchRange(30, 1095, log=True)
+    )
+
+
+@dataclass(frozen=True)
+class BprConfig:
+    """Factores y pasos propios de BPR. No se comparten con ALS.
+
+    `learning_rate` y `regularization` arrancan en 0,01, el defecto de implicit.
+    """
+
+    factors: int = 64
+    iterations: int = 20
+    learning_rate: float = 0.01
+    regularization: float = 0.01
+    half_life_days: float = 365.0
+    search: BprSearch = field(default_factory=BprSearch)
+
+    def __post_init__(self) -> None:
+        if min(self.factors, self.iterations) < 1:
+            raise ValueError("factors e iterations deben ser positivos")
+        if min(self.learning_rate, self.regularization, self.half_life_days) <= 0:
+            raise ValueError(
+                "learning_rate, regularization y half_life_days deben ser positivos"
+            )
+
+
+@dataclass(frozen=True)
+class TfidfSearch:
+    """Hiperparámetros que recorre el study de `--model tfidf`."""
+
+    max_features: SearchRange = field(
+        default_factory=lambda: SearchRange(5_000, 80_000, log=True, integer=True)
+    )
+    half_life_days: SearchRange = field(
+        default_factory=lambda: SearchRange(30, 1095, log=True)
+    )
+
+
+@dataclass(frozen=True)
+class TfidfConfig:
+    """Tope de términos y semivida del perfil TF-IDF, sin un JSON guardado.
+
+    Unigramas, bigramas, `min_df`, `max_df` y el TF sublineal no entran al study.
+    """
+
+    max_features: int = 60_000
+    half_life_days: float = 365.0
+    search: TfidfSearch = field(default_factory=TfidfSearch)
+
+    def __post_init__(self) -> None:
+        if self.max_features < 1:
+            raise ValueError("max_features debe ser positivo")
+        if self.half_life_days <= 0:
+            raise ValueError("half_life_days debe ser positivo")
+
+
+@dataclass(frozen=True)
+class TwoTowerSearch:
+    """Hiperparámetros que recorre el study de `--model two_tower`.
+
+    Cada trial sigue eligiendo las épocas con `max_epochs` y `patience`.
+    Dropout, weight decay, batch, `recent_reads` y `user_authors` quedan fijos.
+    """
+
+    embedding_dim: SearchRange = field(
+        default_factory=lambda: SearchRange(32, 128, log=True, integer=True)
+    )
+    learning_rate: SearchRange = field(
+        default_factory=lambda: SearchRange(1e-4, 3e-3, log=True)
+    )
+    temperature: SearchRange = field(
+        default_factory=lambda: SearchRange(0.02, 0.2, log=True)
+    )
+    min_item_reads: SearchRange = field(
+        default_factory=lambda: SearchRange(2, 20, integer=True)
+    )
+
+
+@dataclass(frozen=True)
+class TwoTowerConfig:
+    """Two-tower de Covington (2016) con la pérdida de Yi (2019).
+
+    El study elige dimensión, learning rate, temperatura y el mínimo de
+    lecturas de un perfume. La época sale de la validación: NDCG@10 del último
+    fold rolling, con patience. `recent_reads` suma a la torre de lector el
+    promedio de sus últimas lecturas (0 lo apaga). `user_authors` suma el
+    promedio de los autores.
+    """
+
+    embedding_dim: int = 64
+    recent_reads: int = 20
+    user_authors: bool = True
+    dropout: float = 0.1
+    temperature: float = 0.05
+    batch_size: int = 1024
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    max_epochs: int = 30
+    patience: int = 3
+    min_item_reads: int = 5
+    search: TwoTowerSearch = field(default_factory=TwoTowerSearch)
+
+    def __post_init__(self) -> None:
+        if min(self.embedding_dim, self.batch_size, self.max_epochs, self.patience) < 1:
+            raise ValueError("dimensión, batch, épocas y patience deben ser positivos")
+        if self.min_item_reads < 1:
+            raise ValueError("min_item_reads debe ser positivo")
+        if self.recent_reads < 0:
+            raise ValueError("recent_reads no puede ser negativo")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout tiene que estar en [0, 1)")
+        if self.temperature <= 0 or self.learning_rate <= 0 or self.weight_decay < 0:
+            raise ValueError("temperatura y learning rate positivos; weight decay no negativo")
+
+
+@dataclass(frozen=True)
+class RankerConfig:
+    """LambdaRank. `n_estimators` y `early_stopping_rounds` no entran a Optuna.
+
+    `label_gain` no entra a la búsqueda y no es un sí/no. `linear` es la
+    identidad 0..5. `exponential` es `2^rating - 1`, la misma ganancia que
+    `sklearn.metrics.ndcg_score`. El valor de esta clase es el de la corrida.
+    Cambiarlo pide un `--tune` nuevo: el historial se eligió bajo la ganancia
+    anterior.
+    """
+
+    n_estimators: int = 200
+    learning_rate: float = 0.04
+    num_leaves: int = 31
+    max_depth: int = -1
+    min_child_samples: int = 30
+    subsample: float = 0.9
+    colsample_bytree: float = 0.9
+    reg_alpha: float = 0.0
+    reg_lambda: float = 1.0
+    early_stopping_rounds: int = 30
+    label_gain: str = "exponential"
+    search: RankerSearch = field(default_factory=RankerSearch)
+
+    def __post_init__(self) -> None:
+        if self.label_gain not in LABEL_GAIN_MODES:
+            raise ValueError("label_gain debe ser 'linear' o 'exponential'")
+
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    """Configuración raíz del pipeline.
+
+    Optuna y el early stopping del último fold puntúan a todos los usuarios
+    de ese fold. `tune_on_example_users` queda apagado: no hay una lista de
+    entrega. El ranker entrena con todos los folds.
+    """
+
+    data_dir: Path = field(default_factory=lambda: DATA_DIR)
+    example_path: Path = Path("ejemplo.csv")
+    artifacts_dir: Path = field(default_factory=lambda: ARTIFACTS_DIR)
+    output_path: Path = Path("submission.csv")
+    random_seed: int = 42
+    run_note: str = ""
+    model: str = "two_stage"
+    optuna_trials: int = 30
+    tune_on_example_users: bool = False
+    split: SplitConfig = field(default_factory=SplitConfig)
+    retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    ranker: RankerConfig = field(default_factory=RankerConfig)
+    ease: EaseConfig = field(default_factory=EaseConfig)
+    two_tower: TwoTowerConfig = field(default_factory=TwoTowerConfig)
+    item_cosine: ItemCosineConfig = field(default_factory=ItemCosineConfig)
+    als: AlsConfig = field(default_factory=AlsConfig)
+    bpr: BprConfig = field(default_factory=BprConfig)
+    tfidf: TfidfConfig = field(default_factory=TfidfConfig)
+
+    def as_dict(self) -> dict[str, Any]:
+        """Devuelve una representación apta para JSON."""
+
+        raw = asdict(self)
+        for key in ("data_dir", "example_path", "artifacts_dir", "output_path"):
+            raw[key] = str(raw[key])
+        return raw

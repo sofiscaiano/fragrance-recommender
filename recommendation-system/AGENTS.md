@@ -1,10 +1,11 @@
 # Cómo modificar este repo
 
-El código es minimalista y simple. Sin sobreingeniería.
+El modelo es el paquete `fragrantica_rec`. La web y `serving/` no se tocan desde acá.
 
-- Un archivo hace una cosa. Una función hace una cosa. Si un cambio necesita una capa, una clase base o un registro de plugins, no hace falta.
-- Los parámetros van en `config.py`. No dejes un número que se pueda querer cambiar dentro de una función.
-- Un modelo nuevo es una función que entrena con train y devuelve una matriz de scores del catálogo. Usa `metrics.py`. No traigas otro split ni otra métrica.
-- Cada corrida se loguea en MLflow con métricas de validación. No se leen ni se loguean métricas de test.
-- El diff se mantiene chico. No agregues un framework que el archivo no necesite.
+- Un cambio de algoritmo entra en la etapa que le corresponde: una fuente en `two_stage/retrieval.py`, una columna del ranker en `two_stage/columns.py`, el corte en `splits.py`.
+- Los parámetros van en `fragrantica_rec/config.py`. No dejes un número que se pueda querer cambiar dentro de una función.
+- La marca es la etiqueta de una sola casa y la familia olfativa es la del género. No agregues una tercera familia de transiciones para perfumistas.
+- La nota es 1–5. La confianza de las fuentes que la normalizan usa `RATING_MAX`.
+- El holdout y el horizonte rolling salen de `SplitConfig`. La métrica del holdout es NDCG@10.
+- Cada corrida se loguea en MLflow. Los artefactos van a `artifacts/`.
 - `SPECS.md` es el contrato del experimento. Si el código y ese archivo se contradicen, manda `SPECS.md`.
