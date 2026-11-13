@@ -37,12 +37,12 @@ fonts:
         <span>App</span>
       </div>
     </div>
-    <Scent kind="bottle" class="cover-bottle" />
+    <Scent kind="bottle" spray class="cover-bottle" />
   </div>
 </div>
 
 <!--
-El recorrido es el del proyecto: cómo se armó el dataset, qué se fue probando en el modelo y cómo queda la app, que hoy ordena el catálogo y va a usar el modelo cuando esté cerrado.
+El recorrido es el del proyecto: cómo se armó el dataset, qué se fue probando en el modelo y cómo queda la app. Para vos ordena con el two-stage. Las otras tres listas siguen por votos, nota y tendencia.
 -->
 
 ---
@@ -87,7 +87,7 @@ layout: none
       <div class="sh-hold"><b>18%</b><span>Holdout</span></div>
     </div>
     <div class="shareuse">
-      <p>Ajusta las fuentes y LambdaRank. Dos ventanas de 10 enseñan a predecir el bloque siguiente.</p>
+      <p>Ajusta el retrieval y LGBMRanker. Dos ventanas de 10 enseñan a predecir el bloque siguiente.</p>
       <p>Las 10 anteriores al holdout. Optuna elige con estas.</p>
       <p>Las últimas 10, el test. No entran al entrenamiento.</p>
     </div>
@@ -114,18 +114,18 @@ layout: none
     <div class="piece">
       <div class="piece-n">02</div>
       <h2>Modelo</h2>
-      <p>Arma un ranking con varias fuentes y lo elige por NDCG en el holdout.</p>
+      <p>Dos etapas. El retrieval junta siete fuentes con RRF. LGBMRanker reordena esa lista.</p>
     </div>
-    <div class="piece piece-next">
+    <div class="piece">
       <div class="piece-n">03</div>
       <h2>App</h2>
-      <p>Hoy ordena el catálogo con reglas. Cuando el modelo esté cerrado, las listas salen de ahí.</p>
+      <p>Para vos ordena con el two-stage. Las otras listas siguen por votos, nota y tendencia.</p>
     </div>
   </div>
 </div>
 
 <!--
-Son tres programas. El scraper escribe el dataset, el recomendador entrena y mide, y la app todavía ordena por votos, nota y tendencia. El destino de la pantalla es servir el ranking del modelo.
+Son tres programas. El scraper escribe el dataset, el recomendador entrena y mide, y la app sirve ese ranking en Para vos. Más populares, mejor puntuados y tendencia siguen siendo reglas del catálogo.
 -->
 
 ---
@@ -136,17 +136,22 @@ layout: none
   <p class="kicker">Scraping</p>
   <h1 class="title sm">De la marca al dataset</h1>
   <div class="step-list">
-    <div class="step"><em>01</em><b>Marcas</b><span>Recorre los diseñadores y arma la lista de perfumes a bajar.</span></div>
-    <div class="step"><em>02</em><b>Perfumes</b><span>De cada ficha saca notas, acordes y las reviews visibles, con un tope que ronda las 200.</span></div>
-    <div class="step"><em>03</em><b>Perfiles</b><span>Entra a quien escribió y baja el historial completo, el wardrobe y los votos.</span></div>
-    <div class="step"><em>04</em><b>Huérfanos</b><span>Si un perfil nombra un perfume que no estaba en la lista, se baja esa ficha.</span></div>
-    <div class="step"><em>05</em><b>k-core</b><span>En local se deduplica y quedan usuario y perfume con al menos 5 interacciones.</span></div>
+    <div class="step"><em>01</em><div class="step-n">121</div><div><b>Marcas</b><span>El índice de diseñadores, y de ahí la lista de perfumes.</span></div></div>
+    <div class="step"><em>02</em><div class="step-n">20.744</div><div><b>Perfumes</b><span>La ficha, con notas, acordes y las reviews visibles.</span></div></div>
+    <div class="step"><em>03</em><div class="step-n">75.077</div><div><b>Perfiles</b><span>Bajados. Quedan 68.010 en la cola.</span></div></div>
+    <div class="step"><em>04</em><div class="step-n">93.316</div><div><b>Huérfanos</b><span>Ids citados en una review o en el wardrobe, sin ficha en el export.</span></div></div>
+    <div class="step"><em>05</em><div class="step-n">5</div><div><b>k-core</b><span>El corte elegido. Usuario y perfume con al menos cinco, hasta que nadie más cae.</span></div></div>
   </div>
-  <p class="facts">El sitio era muy restrictivo: con seis workers devolvía 429 alrededor de los 150 pedidos, así que el crawl quedó en un solo worker con 7–10 segundos entre requests. Después se sumó un proxy de puertos sticky, para seguir por otra salida cuando una IP se quemaba y no tener que frenar en ese bloqueo.</p>
+  <div class="tools">
+    <div><b>curl_cffi</b><span>El pedido</span></div>
+    <div><b>selectolax</b><span>El HTML</span></div>
+    <div><b>DuckDB</b><span>Dedup y k-core</span></div>
+    <div><b>Parquet</b><span>El export</span></div>
+  </div>
 </div>
 
 <!--
-El límite se midió: seis workers disparan un 429 cerca de los 150 requests, y por eso la espera de 7 a 10 segundos. El proxy no saca esa espera de un pedido, pero deja continuar por otro puerto cuando la IP se quema. El k-core no vuelve a la red: se aplica al exportar.
+121 marcas y 20.744 fichas de perfume, todas salidas del listado de marcas. Perfiles: 75.077 bajados y 68.010 todavía pendientes. Los 93.316 salen del export del 11 de octubre: perfume_id distintos que aparecen en una review ya deduplicada o en el wardrobe y no tienen fila en items. No se bajó ninguna de esas fichas. El k-core es 5, elegido al exportar, y se itera hasta punto fijo. El sitio respondía 429 con seis workers cerca de los 150 pedidos, así que el crawl fue un worker con 7–10 segundos, y después un proxy de puertos sticky.
 -->
 
 ---
@@ -207,37 +212,48 @@ layout: none
 
 <div class="frame">
   <p class="kicker">Datos</p>
-  <h1 class="title sm">Usuario, perfume e interacción</h1>
-  <div class="sides">
-    <section>
+  <h1 class="title sm">El esquema</h1>
+  <div class="er">
+    <div class="firma"><b>1</b><span>Firma</span><b>0..1</b></div>
+    <article class="ent">
       <h2>Usuario</h2>
-      <div class="side-rows">
-        <div class="side-row"><div><b>Su actividad</b><span>Cuántas reviews escribió y cuántas notas tiene en el perfil.</span></div></div>
-        <div class="side-row"><div><b>Perfume firma</b><span>El que eligió como propio.</span></div></div>
-        <div class="side-row"><div><b>Su wardrobe</b><span>Cuántos perfumes guardó. El número está en el perfil.</span></div></div>
-      </div>
-    </section>
-    <section>
-      <h2>Perfume</h2>
-      <div class="side-rows">
-        <div class="side-row"><div><b>La ficha</b><span>Marca, género del perfume, año y familia olfativa.</span></div></div>
-        <div class="side-row"><div><b>Quién lo hizo</b><span>El perfumista.</span></div></div>
-        <div class="side-row"><div><b>La composición</b><span>Notas, acordes y la descripción.</span></div></div>
-      </div>
-    </section>
-    <section>
+      <p>Reviews y notas del perfil.</p>
+      <p>Cuántos guardó.</p>
+    </article>
+    <div class="rel">
+      <b>1</b>
+      <div class="rel-line"><span>reseña</span></div>
+      <b>N</b>
+    </div>
+    <article class="ent train">
       <h2>Interacción</h2>
-      <div class="side-rows">
-        <div class="side-row"><div><b>La review</b><span>Nota, fecha y texto de ese perfume.</span></div></div>
-        <div class="side-row"><div><b>El voto</b><span>Duración, estela, estación y si es de día o de noche.</span></div></div>
-      </div>
-    </section>
+      <p>Nota, fecha y texto.</p>
+      <p>Duración, estela y estación.</p>
+      <p>Día o noche.</p>
+    </article>
+    <div class="rel">
+      <b>N</b>
+      <div class="rel-line"><span>sobre</span></div>
+      <b>1</b>
+    </div>
+    <article class="ent">
+      <h2>Perfume</h2>
+      <p>Marca, género, año y familia.</p>
+      <p>Perfumista, notas, acordes, descripción.</p>
+    </article>
+    <div class="er-bridge">
+      <span class="stem left">guarda · 1 a N</span>
+      <span class="stem right">N–1</span>
+    </div>
+    <article class="ent ward">
+      <h2>Wardrobe</h2>
+      <p>Tiene, quiere o tuvo. Sin fecha, así que no entrena. La app oculta lo que ya tiene.</p>
+    </article>
   </div>
-  <p class="side-note">La lista del wardrobe, tiene, quiere o tuvo, es otra tabla. No tiene fecha, así que no entra a entrenar. La app la usa para ocultar lo que la persona ya tiene.</p>
 </div>
 
 <!--
-El perfil del usuario trae conteos de reviews y de notas, el perfume firma y el tamaño del wardrobe. El perfume trae ficha, perfumista y composición. La interacción es la review y el voto. La lista del wardrobe es otra tabla, sin fecha, y no entra a entrenar.
+Un usuario reseña N interacciones, y cada una es sobre un perfume. La firma apunta a lo sumo a un perfume. El wardrobe es otra tabla, 1 a N, tiene/quiere/tuvo, sin fecha, y no entra a entrenar. La app la usa para ocultar lo que ya tiene.
 -->
 
 ---
@@ -245,33 +261,105 @@ layout: none
 ---
 
 <div class="frame">
-  <p class="kicker">Modelo</p>
-  <h1 class="title sm">Siete rankings se funden en uno</h1>
-  <div class="sources">
-    <div><b>Popularidad</b><span>Lo que todos reseñan</span></div>
-    <div><b>Coseno</b><span>Parecido a lo ya puntuado</span></div>
-    <div><b>ALS</b><span>Factores latentes</span></div>
-    <div><b>BPR</b><span>Visto contra no visto</span></div>
-    <div><b>TF-IDF</b><span>Texto de notas y acordes</span></div>
-    <div><b>Two-tower</b><span>Próximas interacciones</span></div>
-    <div><b>EASE</b><span>Pesos ítem a ítem</span></div>
+  <p class="kicker">Modelo · dos etapas</p>
+  <h1 class="title sm">El retrieval trae candidatos. LGBMRanker los ordena.</h1>
+  <div class="stages">
+    <section class="stage">
+      <p class="stage-k">Retrieval</p>
+      <div class="src-cards">
+        <article><b>Popularidad</b><span>La misma lista para todos, por cuántas veces se reseñó.</span></article>
+        <article><b>Coseno</b><span>Cercanos porque los reseñaron las mismas personas.</span></article>
+        <article><b>ALS</b><span>Factores latentes de la persona y del perfume.</span></article>
+        <article><b>BPR</b><span>Arriba lo reseñado, abajo un perfume que no vio.</span></article>
+        <article><b>TF-IDF</b><span>El texto de la ficha contra lo que viene reseñando.</span></article>
+        <article><b>Two-tower</b><span>Una red para el historial y otra para la ficha.</span></article>
+        <article><b>EASE</b><span>Un peso de cada perfume sobre los demás.</span></article>
+      </div>
+      <div class="to-rrf" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+      <div class="rrf-bar">
+        <b>RRF</b>
+        <span>Las siete listas se funden en un ranking: suma de puestos, con el peso de cada fuente. Quedan 146 candidatos.</span>
+      </div>
+    </section>
+    <div class="stage-arrow">→</div>
+    <section class="stage stage-rank">
+      <p class="stage-k">Ranker</p>
+      <div>
+        <b>LGBMRanker</b>
+        <span>El ranker de LightGBM. Reordena solo esos 146. Entrena con objetivo lambdarank: cada par pesa según cuánto movería el NDCG.</span>
+      </div>
+    </section>
   </div>
-  <div class="merge">
-    <div class="merge-box">
-      <b>RRF</b>
-      <span>Cada fuente aporta su puesto, no su score, y la suma deja un prefijo de candidatos.</span>
-    </div>
-    <div class="arrow">→</div>
-    <div class="merge-box main">
-      <b>LambdaRank</b>
-      <span>Es el LGBMRanker de LightGBM. LambdaRank pondera cada par por cuánto cambiaría el NDCG si se invirtieran.</span>
-    </div>
-  </div>
-  <p class="origin">Una review futura que ninguna fuente trajo igual baja el NDCG.</p>
 </div>
 
 <!--
-RRF mira el puesto para que una escala no pise a las otras. LambdaRank es LightGBM en modo ranking: el gradiente de cada par depende de cuánto subiría o bajaría el NDCG al invertirlos, y solo reordena el prefijo. Un positivo que el retrieval no trajo penaliza igual.
+Son dos etapas. El retrieval son las siete fuentes: popularidad, coseno, ALS, BPR, TF-IDF, two-tower y EASE. RRF junta puestos, no scores, y se queda con 146. El modelo que reordena ese prefijo es LGBMRanker, de LightGBM. Lambdarank es el objetivo de entrenamiento, no el nombre del modelo. Una review que ninguna fuente trajo baja el NDCG igual.
+-->
+
+---
+layout: none
+---
+
+<div class="frame">
+  <p class="kicker">Optuna · último fold de validación</p>
+  <h1 class="title sm">Hiperparámetros seleccionados</h1>
+  <div class="tune">
+    <article>
+      <b>Coseno</b>
+      <span><em>812</em> half_life_days</span>
+    </article>
+    <article>
+      <b>ALS</b>
+      <span><em>21</em> factors · <em>36</em> iterations</span>
+      <span><em>3.53</em> regularization · <em>555</em> half_life_days</span>
+    </article>
+    <article>
+      <b>BPR</b>
+      <span><em>63</em> factors · <em>59</em> iterations</span>
+      <span><em>0.0135</em> learning_rate · <em>1.91×10⁻⁴</em> regularization</span>
+      <span><em>63.7</em> half_life_days</span>
+    </article>
+    <article>
+      <b>TF-IDF</b>
+      <span><em>19.931</em> max_features</span>
+      <span><em>128</em> half_life_days</span>
+    </article>
+    <article>
+      <b>Two-tower</b>
+      <span><em>79</em> embedding_dim · <em>0.00243</em> learning_rate</span>
+      <span><em>0.122</em> temperature · <em>16</em> min_item_reads</span>
+      <span class="hp-note">Vocabulario: perfumes con al menos 16 interacciones.</span>
+    </article>
+    <article>
+      <b>EASE</b>
+      <span><em>1.12×10⁴</em> reg_lambda</span>
+      <span><em>24</em> min_interactions</span>
+      <span class="hp-note">Matriz ítem-ítem: ítems con al menos 24 interacciones.</span>
+    </article>
+    <article>
+      <b>Popularidad</b>
+      <span>Sin búsqueda. El orden es el conteo.</span>
+    </article>
+    <article>
+      <b>Fusión</b>
+      <span><em>146</em> rrf_cutoff</span>
+      <span>source_weight por fuente</span>
+    </article>
+  </div>
+  <div class="tune-rank">
+    <b>LGBMRanker</b>
+    <span><em>0.0196</em>learning_rate</span>
+    <span><em>23</em>num_leaves</span>
+    <span><em>11</em>max_depth</span>
+    <span><em>75</em>min_child_samples</span>
+    <span><em>0.699</em>subsample</span>
+    <span><em>0.628</em>colsample_bytree</span>
+  </div>
+  <p class="src-foot">Cada fuente se ajustó en su estudio. El two-stage reutiliza esos valores. Optuna selecciona el corte, los pesos y el ranker sobre el último fold. El holdout no interviene.</p>
+</div>
+
+<!--
+Cada fuente tiene su estudio. Coseno: half_life_days 812. ALS: factors 21, iterations 36, regularization 3.53, half_life_days 555. BPR: factors 63, iterations 59, learning_rate 0.0135, regularization 1.91e-4, half_life_days 63.7. TF-IDF: max_features 19931, half_life_days 128. Two-tower: embedding_dim 79, learning_rate 0.00243, temperature 0.122, min_item_reads 16: solo entran al vocabulario los perfumes con al menos 16 interacciones. EASE: reg_lambda 11154, min_interactions 24: la matriz ítem-ítem descarta los ítems con menos de 24 interacciones. Popularidad no se busca. Optuna del two-stage elige rrf_cutoff 146, un source_weight por fuente y el LGBMRanker: learning_rate 0.0196, num_leaves 23, max_depth 11, min_child_samples 75, subsample 0.699, colsample_bytree 0.628. reg_alpha y reg_lambda quedaron cerca de cero. El objetivo es lambdarank. El holdout no interviene.
 -->
 
 ---
@@ -285,7 +373,7 @@ layout: none
     <div class="log-item"><em>01</em><div><b>Popularidad</b><span>Una lista común, con semivida, para tener el piso de lo que se gana al personalizar.</span></div></div>
     <div class="log-item"><em>02</em><div><b>Fuentes solas</b><span>Se barrieron ALS, ítem-kNN, EASE y un two-tower, cada uno con su grilla de hiperparámetros.</span></div></div>
     <div class="log-item"><em>03</em><div><b>Contenido</b><span>El two-tower se probó también solo con ids, para ver si notas y acordes aportaban.</span></div></div>
-    <div class="log-item"><em>04</em><div><b>Two-stage</b><span>Esas fuentes se fusionan con RRF y LightGBM LambdaRank. Optuna elige sobre el último fold, no sobre el holdout.</span></div></div>
+    <div class="log-item"><em>04</em><div><b>Two-stage</b><span>Esas fuentes se fusionan con RRF y LGBMRanker. Optuna elige sobre el último fold, no sobre el holdout.</span></div></div>
   </div>
 </div>
 
@@ -298,65 +386,104 @@ layout: none
 ---
 
 <div class="frame">
-  <p class="kicker">NDCG@10 · 2.473 usuarios · 13 nov · pesos del RRF a las 13:01</p>
-  <h1 class="title sm">Cada fuente sola, y el peso que quedó</h1>
+  <p class="kicker">NDCG@10 · 2.473 usuarios</p>
+  <h1 class="title sm">Cada fuente sola, y las siete juntas</h1>
   <div class="src-board">
-    <div class="src-head"><span></span><span>Sola</span><span>Peso en el RRF</span></div>
     <div class="src-row">
       <b>EASE</b>
-      <div class="src-bar"><i style="width: 100%"></i></div>
+      <div class="src-bar"><i style="width: 79%"></i></div>
       <em>0.082</em>
-      <div class="src-bar w"><i style="width: 30%"></i></div>
-      <em>0.101</em>
     </div>
     <div class="src-row">
       <b>ALS</b>
-      <div class="src-bar"><i style="width: 96%"></i></div>
+      <div class="src-bar"><i style="width: 76%"></i></div>
       <em>0.079</em>
-      <div class="src-bar w"><i style="width: 36%"></i></div>
-      <em>0.121</em>
     </div>
     <div class="src-row">
       <b>Coseno</b>
-      <div class="src-bar"><i style="width: 88%"></i></div>
+      <div class="src-bar"><i style="width: 69%"></i></div>
       <em>0.072</em>
-      <div class="src-bar w"><i style="width: 18%"></i></div>
-      <em>0.059</em>
     </div>
     <div class="src-row">
       <b>BPR</b>
-      <div class="src-bar"><i style="width: 70%"></i></div>
+      <div class="src-bar"><i style="width: 55%"></i></div>
       <em>0.057</em>
-      <div class="src-bar w"><i style="width: 12%"></i></div>
-      <em>0.039</em>
     </div>
     <div class="src-row">
       <b>TF-IDF</b>
-      <div class="src-bar"><i style="width: 62%"></i></div>
+      <div class="src-bar"><i style="width: 49%"></i></div>
       <em>0.051</em>
-      <div class="src-bar w"><i style="width: 97%"></i></div>
-      <em>0.324</em>
     </div>
     <div class="src-row">
       <b>Popularidad</b>
-      <div class="src-bar"><i style="width: 33%"></i></div>
+      <div class="src-bar"><i style="width: 26%"></i></div>
       <em>0.027</em>
-      <div class="src-bar w"><i style="width: 100%"></i></div>
-      <em>0.334</em>
     </div>
     <div class="src-row">
       <b>Two-tower</b>
       <div class="src-bar"></div>
       <em class="missing">—</em>
-      <div class="src-bar w"><i style="width: 6%"></i></div>
-      <em>0.021</em>
+    </div>
+    <div class="src-row best">
+      <b>Two-stage</b>
+      <div class="src-bar"><i style="width: 100%"></i></div>
+      <em>0.104</em>
     </div>
   </div>
-  <p class="src-foot">Los pesos suman 1 y salen del tuneo de las 13:01. Juntas y reordenadas, el two-stage llega a 0.104. El two-tower no se midió solo ese día.</p>
 </div>
 
 <!--
-Holdout del 13 de noviembre, mismas 2.473 personas. Solas: EASE 0.082, ALS 0.079, coseno 0.072, BPR 0.057, TF-IDF 0.051, popularidad 0.027. El two-tower no tiene medición sola de ese día. Los pesos del RRF, normalizados, son popularidad 0.334, TF-IDF 0.324, ALS 0.121, EASE 0.101, coseno 0.059, BPR 0.039 y two-tower 0.021. El two-stage llega a 0.104.
+Mismas 2.473 personas. Solas: EASE 0.082, ALS 0.079, coseno 0.072, BPR 0.057, TF-IDF 0.051, popularidad 0.027. El two-tower no tiene NDCG solo. Las siete juntas, two-stage, llegan a 0.104.
+-->
+
+---
+layout: none
+---
+
+<div class="frame">
+  <p class="kicker">RRF · los pesos suman 1</p>
+  <h1 class="title sm">Cuánto empuja cada fuente</h1>
+  <div class="src-board weights">
+    <div class="src-row">
+      <b>Popularidad</b>
+      <div class="src-bar"><i style="width: 100%"></i></div>
+      <em>0.334</em>
+    </div>
+    <div class="src-row">
+      <b>TF-IDF</b>
+      <div class="src-bar"><i style="width: 97%"></i></div>
+      <em>0.324</em>
+    </div>
+    <div class="src-row">
+      <b>ALS</b>
+      <div class="src-bar"><i style="width: 36%"></i></div>
+      <em>0.121</em>
+    </div>
+    <div class="src-row">
+      <b>EASE</b>
+      <div class="src-bar"><i style="width: 30%"></i></div>
+      <em>0.101</em>
+    </div>
+    <div class="src-row">
+      <b>Coseno</b>
+      <div class="src-bar"><i style="width: 18%"></i></div>
+      <em>0.059</em>
+    </div>
+    <div class="src-row">
+      <b>BPR</b>
+      <div class="src-bar"><i style="width: 12%"></i></div>
+      <em>0.039</em>
+    </div>
+    <div class="src-row">
+      <b>Two-tower</b>
+      <div class="src-bar"><i style="width: 6%"></i></div>
+      <em>0.021</em>
+    </div>
+  </div>
+</div>
+
+<!--
+Pesos del RRF ya normalizados: popularidad 0.334, TF-IDF 0.324, ALS 0.121, EASE 0.101, coseno 0.059, BPR 0.039, two-tower 0.021.
 -->
 
 ---
@@ -414,33 +541,30 @@ layout: none
 ---
 
 <div class="frame">
-  <p class="kicker">Dónde se corta</p>
-  <h1 class="title sm">La lista es más corta, y el orden sigue corto.</h1>
-  <div class="gap">
-    <div>
-      <div class="gap-num">0.46</div>
-      <b>Recall del retrieval</b>
-      <span>Mira 146 de 1.088 perfumes y trae esa fracción de las próximas reviews.</span>
-    </div>
+  <p class="kicker">Two-stage · holdout · 2.473 usuarios · 13 nov</p>
+  <h1 class="title sm">Métricas</h1>
+  <div class="gap hold">
     <div>
       <div class="gap-num">0.104</div>
-      <b>NDCG@10 real</b>
-      <span>El top 10 del two-stage. Traer la review no la deja primera.</span>
+      <b>NDCG@10</b>
     </div>
-    <div class="win">
+    <div>
+      <div class="gap-num">0.027</div>
+      <b>NDCG@10 de popularidad</b>
+    </div>
+    <div>
+      <div class="gap-num">0.46</div>
+      <b>Recall</b>
+    </div>
+    <div>
       <div class="gap-num">0.59</div>
-      <b>Si el orden fuera perfecto</b>
-      <span>El NDCG de esas mismas reviews si LambdaRank las hubiera puesto arriba.</span>
+      <b>Oracle NDCG@10</b>
     </div>
-  </div>
-  <div class="dead">
-    <div><b>0.068</b><span>Two-tower solo con ids. Cubre el 32%. Con el contenido del perfume llega a 0.077 y cubre el 56%.</span></div>
-    <div><b>0.030</b><span>Two-tower con learning rate 0.0001. Cae al nivel de la popularidad.</span></div>
   </div>
 </div>
 
 <!--
-En la corrida de las 13:01 el retrieval mira 146 de 1.088 perfumes y el recall queda en 0.46. Si el ranker pusiera primeras las que sí trajo, el NDCG sería 0.59 y queda en 0.104. La torre sin contenido, de una corrida anterior, baja a 0.068, y un learning rate de 0.0001 la deja en 0.030.
+Corrida 20261113-130113. NDCG@10 0.104, baseline de popularidad 0.027, recall del retrieval 0.46, oracle NDCG@10 0.59. Lista de 146 candidatos.
 -->
 
 ---
@@ -448,51 +572,40 @@ layout: none
 ---
 
 <div class="frame">
-  <p class="kicker">App</p>
-  <h1 class="title sm">Hoy son reglas. Después, el modelo.</h1>
-  <div class="grid-2">
-    <div class="cell">
-      <div class="cell-k">Conocido</div>
-      <div class="lbl">Oculta lo que ya tiene</div>
-      <div class="sub">Si el usuario está en el dataset, se esconden sus reviews y su wardrobe. La encuesta no se usa.</div>
+  <p class="kicker">App · Para vos</p>
+  <h1 class="title sm">Cada pedido recorre el modelo</h1>
+  <div class="circuit">
+    <div class="circuit-in">
+      <article>
+        <b>Conocido</b>
+        <span>Historial del dataset. Se ocultan sus reviews y su wardrobe.</span>
+      </article>
+      <article>
+        <b>Nuevo</b>
+        <span>Encuesta de marca, género del perfume, perfumista y familia. Con eso se filtran las tres listas del catálogo. Para vos, sin historial, arranca por popularidad.</span>
+      </article>
     </div>
-    <div class="cell">
-      <div class="cell-k">Nuevo</div>
-      <div class="lbl">Encuesta</div>
-      <div class="sub">Si no está, filtra por marca, género del perfume, perfumista y familia olfativa.</div>
-    </div>
+    <div class="circuit-arrow">→</div>
+    <article class="circuit-model">
+      <b>Two-stage</b>
+      <span>Siete fuentes, RRF y LGBMRanker. Sobre el historial de ese pedido.</span>
+    </article>
+    <div class="circuit-arrow">→</div>
+    <article class="circuit-out">
+      <b>20</b>
+      <span>Para vos</span>
+    </article>
   </div>
-  <div class="lists">
-    <div class="list-card"><b>Más populares</b><span>Más votos de la comunidad</span></div>
-    <div class="list-card"><b>Mejor puntuados</b><span>Nota alta, entre los que tienen bastantes votos</span></div>
-    <div class="list-card"><b>Tendencia</b><span>Más interacciones fechadas en 365 días</span></div>
+  <div class="circuit-loop">
+    <b>Puntúa</b>
+    <span>La nota entra al historial, esa card sale, y el mismo circuito se arma de nuevo. No reentrena.</span>
   </div>
-  <p class="app-note">De a 20, solo con nota media de al menos 3. Puntuar una card la saca de la sesión y no reentrena. Estas tres listas van a salir del modelo cuando esté cerrado.</p>
-</div>
-
-<!--
-Usuario conocido: se oculta lo que ya tiene. Usuario nuevo: se filtra por lo que eligió. Las tres pestañas son reglas sobre el catálogo. Cuando el two-stage esté cerrado, la misma pantalla ordena con ese ranking.
--->
-
----
-layout: none
----
-
-<div class="frame">
-  <p class="kicker">Cierre</p>
-  <h1 class="title sm">El ranking sube.<br>El top 10, todavía no.</h1>
-  <div class="close close-2">
-    <div>
-      <div class="num hero">0.104</div>
-      <div class="lbl">NDCG@10, desde 0.027 de popularidad y arriba de 0.082 de la mejor fuente sola.</div>
-    </div>
-    <div>
-      <div class="num close-open">Sigue</div>
-      <div class="lbl">Cerrar el modelo y servirlo en la app.</div>
-    </div>
+  <div class="circuit-side">
+    <b>Al lado</b>
+    <span>Más populares, mejor puntuados y tendencia, con nota media de al menos 3, acotadas por la encuesta.</span>
   </div>
 </div>
 
 <!--
-Se pasó de 0.027 a 0.104, por encima de EASE. El retrieval de esta corrida mira 146 perfumes y el orden del top 10 sigue siendo el hueco. Lo que sigue es conectar ese ranking a la app.
+Para vos corre el two-stage en cada pedido. Si la persona está en el dataset, el historial son sus reviews y se ocultan reviews y wardrobe. Si es nueva, primero responde la encuesta de marca, género del perfume, perfumista y familia. Esa encuesta deja, en las tres listas del catálogo, solo los perfumes que coinciden con lo que eligió. Para vos no tiene historial, así que esa lista arranca por popularidad del modelo. Un puntaje de la sesión se suma a ese historial y se vuelve a pedir el ranking, sin reentrenar.
 -->
