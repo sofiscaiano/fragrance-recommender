@@ -12,6 +12,7 @@ import typer
 
 from fragrantica_rec.config import ARTIFACTS_DIR, DATA_DIR, PipelineConfig
 from fragrantica_rec.pipeline import evaluate as evaluate_pipeline
+from fragrantica_rec.serving import export_serving_artifact
 
 app = typer.Typer(
     help="Recomendador de perfumes. --model elige two_stage, popularity o una fuente",
@@ -225,6 +226,30 @@ def evaluate(
         two_tower_source=two_tower_source,
         ease_source=ease_source,
     )
+
+
+@app.command("export-serving")
+def export_serving(
+    data: DataOption = DATA_DIR,
+    artifacts: ArtifactsOption = ARTIFACTS_DIR,
+    seed: SeedOption = None,
+) -> None:
+    """Ajusta las fuentes sobre todo el historial y escribe serving.joblib.
+
+    El LambdaRank es el de evaluated_pipeline.joblib. No vuelve a entrenarlo.
+    """
+
+    _configure_logging(artifacts)
+    config = _config(
+        data,
+        artifacts,
+        seed,
+        note="export serving",
+        label_gain=None,
+        model="two_stage",
+    )
+    path = export_serving_artifact(config)
+    print(path)
 
 
 if __name__ == "__main__":

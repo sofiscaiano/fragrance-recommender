@@ -81,6 +81,56 @@ def test_trending_usa_el_anio_y_sigue_sacando_lo_visto() -> None:
     assert [item.perfume_id for item in result.perfumes] == [2]
 
 
+def test_para_vos_sin_modelo_responde_503() -> None:
+    with TestClient(create_app(catalog())) as client:
+        response = client.post(
+            "/recomendaciones",
+            json={
+                "username": "ada",
+                "tab": "para_vos",
+                "valoraciones": [{"perfume_id": 2, "rating": 5}],
+                "preferencias": {},
+            },
+        )
+        assert response.status_code == 503
+
+
+def test_para_vos_usa_la_nota_y_no_aplica_el_piso_ni_la_encuesta() -> None:
+    class Recorder:
+        def __init__(self) -> None:
+            self.member_id: int | None = None
+            self.ratings: list[tuple[int, int]] = []
+            self.exclude: set[int] = set()
+
+        def rank(
+            self,
+            member_id: int | None,
+            ratings: list[tuple[int, int]],
+            exclude: set[int],
+        ) -> list[int]:
+            self.member_id = member_id
+            self.ratings = list(ratings)
+            self.exclude = set(exclude)
+            return [2, 1, 3]
+
+    loaded = catalog()
+    recorder = Recorder()
+    loaded.personal = recorder
+    result = loaded.recommend(
+        "Ada",
+        "para_vos",
+        [2],
+        Preferences(brands=frozenset({"Chanel"})),
+        {2: 4},
+    )
+    assert recorder.member_id == 7
+    assert recorder.ratings == [(2, 4)]
+    assert recorder.exclude == {1, 2}
+    # 1 ya lo vio, 2 lo puntuó. 3 queda aunque esté bajo ok y no sea Chanel.
+    assert [item.perfume_id for item in result.perfumes] == [3]
+    assert result.tab == "para_vos"
+
+
 def test_desconocido_aplica_la_encuesta() -> None:
     result = catalog().recommend(
         "Nadie",

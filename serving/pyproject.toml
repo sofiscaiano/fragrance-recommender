@@ -8,7 +8,12 @@ dependencies = [
     "uvicorn>=0.32",
     "pydantic>=2.7",
     "duckdb>=1.0",
+    "recommendation-system",
+    "scikit-learn==1.7.2",
 ]
+
+[tool.uv.sources]
+recommendation-system = { path = "../recommendation-system", editable = true }
 
 [project.scripts]
 fragrantica-serve = "fragrantica_serving.app:main"

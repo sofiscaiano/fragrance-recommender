@@ -1,7 +1,8 @@
-"""Ranking de popularidad y de mejor puntaje, sin modelo.
+"""Ranking por reglas de popularidad, nota y tendencia, y el orden del modelo en «Para vos».
 
 El voto de Fragrantica es 1–5 (odio, disgusto, ok, me gusta, me encanta).
-Entran perfumes con promedio de al menos 3, o sea ok.
+En las tres listas por reglas entran perfumes con promedio de al menos 3, o sea ok.
+«Para vos» no usa ese piso: el orden lo da el two-stage.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ MIN_RATING = 3.0
 PAGE_SIZE = 20
 # Ventana móvil desde la interacción fechada más nueva del dataset.
 TREND_WINDOW_SECONDS = 365 * 24 * 60 * 60
-Tab = Literal["populares", "mejor_puntuados", "trending"]
+Tab = Literal["populares", "mejor_puntuados", "trending", "para_vos"]
 
 
 @dataclass(frozen=True)

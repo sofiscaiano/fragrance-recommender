@@ -12,7 +12,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
-from fragrantica_serving.catalog import Catalog, Recommendation, load_catalog
+from fragrantica_serving.catalog import (
+    Catalog,
+    ModelUnavailable,
+    Recommendation,
+    data_dir,
+    load_catalog,
+)
 from fragrantica_serving.ranking import Item, Preferences, Tab
 
 LOGGER = logging.getLogger("uvicorn.error")
@@ -146,7 +152,11 @@ def create_app(catalog: Catalog | None = None) -> FastAPI:
         if catalog is None:
             LOGGER.info("Cargando catálogo")
             started = time.perf_counter()
-            app.state.catalog = load_catalog()
+            loaded = load_catalog()
+            from fragrantica_serving.personal import attach_model
+
+            attach_model(loaded, data_dir())
+            app.state.catalog = loaded
             LOGGER.info("Catálogo listo en %.1f s", time.perf_counter() - started)
         else:
             app.state.catalog = catalog
@@ -187,12 +197,16 @@ def create_app(catalog: Catalog | None = None) -> FastAPI:
     @app.post("/recomendaciones", response_model=RecommendOut)
     def recomendaciones(body: RecommendIn, request: Request) -> RecommendOut:
         started = time.perf_counter()
-        result = _catalog(request).recommend(
-            body.username,
-            body.tab,
-            (rating.perfume_id for rating in body.valoraciones),
-            body.preferencias.to_domain(),
-        )
+        try:
+            result = _catalog(request).recommend(
+                body.username,
+                body.tab,
+                (rating.perfume_id for rating in body.valoraciones),
+                body.preferencias.to_domain(),
+                {rating.perfume_id: rating.rating for rating in body.valoraciones},
+            )
+        except ModelUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         LOGGER.info(
             "Recomendación de %s (%s) en %.3f s",
             result.username,

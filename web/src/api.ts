@@ -40,7 +40,7 @@ export type OptionsResponse = {
 };
 
 export type RecommendationResponse = SessionResponse & {
-  tab: "populares" | "trending" | "mejor_puntuados";
+  tab: "populares" | "trending" | "mejor_puntuados" | "para_vos";
   perfumes: Perfume[];
 };
 

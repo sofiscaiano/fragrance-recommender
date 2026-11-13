@@ -232,6 +232,9 @@ function SurveyPage() {
 }
 
 function tabCopy(tab: Tab): string {
+  if (tab === "para_vos") {
+    return "El orden del modelo, con tu historial. Si puntuás un perfume, entra a ese historial y la lista se vuelve a armar, sin mostrarlo.";
+  }
   if (tab === "trending") {
     return "Los que más interacciones tuvieron en el último año, con un rating de al menos ok.";
   }
@@ -244,7 +247,7 @@ function tabCopy(tab: Tab): string {
 function RecommendPage() {
   const { username } = useParams({ from: "/recomendar/$username" });
   const navigate = useNavigate();
-  const [tab, setTab] = useState<Tab>("populares");
+  const [tab, setTab] = useState<Tab>("para_vos");
   const [submitted, setSubmitted] = useState(() => loadRatings(username));
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const session = useQuery({
@@ -311,6 +314,13 @@ function RecommendPage() {
           <div className="mb-4 flex flex-wrap gap-2">
             <Button
               type="button"
+              variant={tab === "para_vos" ? "default" : "outline"}
+              onClick={() => setTab("para_vos")}
+            >
+              Para vos
+            </Button>
+            <Button
+              type="button"
               variant={tab === "populares" ? "default" : "outline"}
               onClick={() => setTab("populares")}
             >
@@ -337,7 +347,9 @@ function RecommendPage() {
               <TriangleAlert />
               <AlertTitle>Perfil nuevo</AlertTitle>
               <AlertDescription>
-                La lista sale de la pestaña y de lo que hayas elegido en la encuesta.
+                {tab === "para_vos"
+                  ? "Todavía no hay historial en el dataset. La lista arranca por popularidad del modelo y se rearma con cada puntaje de esta sesión."
+                  : "La lista sale de la pestaña y de lo que hayas elegido en la encuesta."}
               </AlertDescription>
             </Alert>
           ) : null}
