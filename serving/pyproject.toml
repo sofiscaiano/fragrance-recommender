@@ -1,0 +1,31 @@
+[project]
+name = "fragrantica-serving"
+version = "0.1.0"
+description = "API de recomendaciones de perfumes sobre el dataset de Fragrantica"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "pydantic>=2.7",
+    "duckdb>=1.0",
+]
+
+[project.scripts]
+fragrantica-serve = "fragrantica_serving.app:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "httpx>=0.27",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fragrantica_serving"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
