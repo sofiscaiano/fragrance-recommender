@@ -28,21 +28,13 @@ _SUMMARY_ARTIFACTS = (
     "data_quality.json",
     "run.log",
 )
-_MODEL_ARTIFACTS = {
-    "two_stage": (
-        "tuned_hyperparameters.json",
-        "tuning_history.json",
-        "retrieval_folds.csv",
-        "feature_ablations.csv",
-        "feature_importance.csv",
-    ),
-    "ease": ("ease_hyperparameters.json",),
-    "two_tower": ("two_tower_hyperparameters.json",),
-    "item_cosine": ("item_cosine_hyperparameters.json",),
-    "als": ("als_hyperparameters.json",),
-    "bpr": ("bpr_hyperparameters.json",),
-    "tfidf": ("tfidf_hyperparameters.json",),
-}
+_MODEL_ARTIFACTS = (
+    "tuned_hyperparameters.json",
+    "tuning_history.json",
+    "retrieval_folds.csv",
+    "feature_ablations.csv",
+    "feature_importance.csv",
+)
 _current_run_name: ContextVar[str] = ContextVar("current_run_name", default="")
 
 
@@ -66,20 +58,8 @@ def new_run_name(
 
 
 def _reuses_saved_file(config: PipelineConfig) -> bool:
-    """El modo `tuned` mira el JSON del modelo de esta corrida, no el de otro."""
+    """El modo `tuned` mira el historial de two_stage para esta config."""
 
-    if config.model == "ease":
-        from .ease import has_saved_ease_hyperparameters
-
-        return has_saved_ease_hyperparameters(config.artifacts_dir)
-    if config.model == "two_tower":
-        from .source_models import has_saved_two_tower_hyperparameters
-
-        return has_saved_two_tower_hyperparameters(config.artifacts_dir)
-    if config.model in {"item_cosine", "als", "bpr", "tfidf"}:
-        from .source_models import has_saved_source_hyperparameters
-
-        return has_saved_source_hyperparameters(config.artifacts_dir, config.model)
     return has_matching_tuned_hyperparameters(config)
 
 
@@ -343,18 +323,14 @@ def log_evaluation(report: EvaluationReport) -> None:
     mlflow.log_metrics(_metrics(report))
 
 
-def log_summary_artifacts(artifacts_dir: Path, *, model: str) -> None:
-    """Adjunta los JSON y CSV de diagnóstico, sin rankings ni modelos.
-
-    Cada modelo sube su propio archivo de hiperparámetros. Una corrida de
-    EASE no se queda con el JSON ni los pliegues de two_stage, ni al revés.
-    """
+def log_summary_artifacts(artifacts_dir: Path) -> None:
+    """Adjunta los JSON y CSV de diagnóstico de two_stage, sin rankings ni modelos."""
 
     import mlflow
 
     if mlflow.active_run() is None:
         return
-    names = _SUMMARY_ARTIFACTS + _MODEL_ARTIFACTS.get(model, ())
+    names = _SUMMARY_ARTIFACTS + _MODEL_ARTIFACTS
     for name in names:
         path = artifacts_dir / name
         if path.is_file():

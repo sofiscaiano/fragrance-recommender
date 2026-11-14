@@ -88,7 +88,7 @@ class RetrievalConfig:
 
     Los hiperparámetros de cada fuente no viven acá. Salen del JSON de esa
     fuente, o de su config si el archivo no existe. `recency_half_life_days`
-    es solo la semivida con la que EASE puntúa: su study no la busca.
+    es la semivida con la que EASE puntúa.
     """
 
     rrf_k: float = 60.0  # valor estandar
@@ -155,50 +155,22 @@ LABEL_GAIN_MODES = ("linear", "exponential")
 
 
 @dataclass(frozen=True)
-class EaseSearch:
-    """Hiperparámetros que recorre el study de `--model ease`.
-
-    `two_stage` no los busca. La fuente usa el JSON de EASE o estos valores,
-    y Optuna solo elige el peso de esa lista en la fusión. La recencia del
-    perfil no entra: sale de `RetrievalConfig.recency_half_life_days`.
-    """
-
-    reg_lambda: SearchRange = field(
-        default_factory=lambda: SearchRange(100.0, 100_000.0, log=True)
-    )
-    min_interactions: SearchRange = field(
-        default_factory=lambda: SearchRange(10, 100, log=True, integer=True)
-    )
-
-
-@dataclass(frozen=True)
 class EaseConfig:
     """λ y el mínimo de lecturas de EASE, si no hay un JSON guardado.
 
     La matriz siempre lleva el rating. Al puntuar, ese rating se multiplica
-    por la recencia (`RetrievalConfig.recency_half_life_days`). El study no
-    elige esa semivida. Con `retrieval.ease_source`, two_stage arma la misma
-    matriz: el JSON de un tuneo de EASE gana y no lo pisa.
+    por la recencia (`RetrievalConfig.recency_half_life_days`). two_stage no
+    busca estos dos valores: lee el JSON o esta config, y solo elige el peso.
     """
 
     reg_lambda: float = 15_000.0
     min_interactions: int = 20
-    search: EaseSearch = field(default_factory=EaseSearch)
 
     def __post_init__(self) -> None:
         if self.reg_lambda <= 0:
             raise ValueError("reg_lambda debe ser positivo")
         if self.min_interactions < 1:
             raise ValueError("min_interactions debe ser positivo")
-
-
-@dataclass(frozen=True)
-class ItemCosineSearch:
-    """Semivida que recorre el study de `--model item_cosine`."""
-
-    half_life_days: SearchRange = field(
-        default_factory=lambda: SearchRange(30, 1095, log=True)
-    )
 
 
 @dataclass(frozen=True)
@@ -210,29 +182,10 @@ class ItemCosineConfig:
     """
 
     half_life_days: float = 365.0
-    search: ItemCosineSearch = field(default_factory=ItemCosineSearch)
 
     def __post_init__(self) -> None:
         if self.half_life_days <= 0:
             raise ValueError("half_life_days debe ser positivo")
-
-
-@dataclass(frozen=True)
-class AlsSearch:
-    """Hiperparámetros que recorre el study de `--model als`."""
-
-    factors: SearchRange = field(
-        default_factory=lambda: SearchRange(16, 256, log=True, integer=True)
-    )
-    iterations: SearchRange = field(
-        default_factory=lambda: SearchRange(5, 40, integer=True)
-    )
-    regularization: SearchRange = field(
-        default_factory=lambda: SearchRange(1e-3, 10.0, log=True)
-    )
-    half_life_days: SearchRange = field(
-        default_factory=lambda: SearchRange(30, 1095, log=True)
-    )
 
 
 @dataclass(frozen=True)
@@ -247,34 +200,12 @@ class AlsConfig:
     iterations: int = 20
     regularization: float = 0.01
     half_life_days: float = 365.0
-    search: AlsSearch = field(default_factory=AlsSearch)
 
     def __post_init__(self) -> None:
         if min(self.factors, self.iterations) < 1:
             raise ValueError("factors e iterations deben ser positivos")
         if self.regularization <= 0 or self.half_life_days <= 0:
             raise ValueError("regularization y half_life_days deben ser positivos")
-
-
-@dataclass(frozen=True)
-class BprSearch:
-    """Hiperparámetros que recorre el study de `--model bpr`."""
-
-    factors: SearchRange = field(
-        default_factory=lambda: SearchRange(16, 256, log=True, integer=True)
-    )
-    iterations: SearchRange = field(
-        default_factory=lambda: SearchRange(10, 100, integer=True)
-    )
-    learning_rate: SearchRange = field(
-        default_factory=lambda: SearchRange(1e-3, 0.1, log=True)
-    )
-    regularization: SearchRange = field(
-        default_factory=lambda: SearchRange(1e-4, 1.0, log=True)
-    )
-    half_life_days: SearchRange = field(
-        default_factory=lambda: SearchRange(30, 1095, log=True)
-    )
 
 
 @dataclass(frozen=True)
@@ -289,7 +220,6 @@ class BprConfig:
     learning_rate: float = 0.01
     regularization: float = 0.01
     half_life_days: float = 365.0
-    search: BprSearch = field(default_factory=BprSearch)
 
     def __post_init__(self) -> None:
         if min(self.factors, self.iterations) < 1:
@@ -301,27 +231,14 @@ class BprConfig:
 
 
 @dataclass(frozen=True)
-class TfidfSearch:
-    """Hiperparámetros que recorre el study de `--model tfidf`."""
-
-    max_features: SearchRange = field(
-        default_factory=lambda: SearchRange(5_000, 80_000, log=True, integer=True)
-    )
-    half_life_days: SearchRange = field(
-        default_factory=lambda: SearchRange(30, 1095, log=True)
-    )
-
-
-@dataclass(frozen=True)
 class TfidfConfig:
     """Tope de términos y semivida del perfil TF-IDF, sin un JSON guardado.
 
-    Unigramas, bigramas, `min_df`, `max_df` y el TF sublineal no entran al study.
+    Unigramas, bigramas, `min_df`, `max_df` y el TF sublineal quedan fijos.
     """
 
     max_features: int = 60_000
     half_life_days: float = 365.0
-    search: TfidfSearch = field(default_factory=TfidfSearch)
 
     def __post_init__(self) -> None:
         if self.max_features < 1:
@@ -331,36 +248,14 @@ class TfidfConfig:
 
 
 @dataclass(frozen=True)
-class TwoTowerSearch:
-    """Hiperparámetros que recorre el study de `--model two_tower`.
-
-    Cada trial sigue eligiendo las épocas con `max_epochs` y `patience`.
-    Dropout, weight decay, batch, `recent_reads` y `user_authors` quedan fijos.
-    """
-
-    embedding_dim: SearchRange = field(
-        default_factory=lambda: SearchRange(32, 128, log=True, integer=True)
-    )
-    learning_rate: SearchRange = field(
-        default_factory=lambda: SearchRange(1e-4, 3e-3, log=True)
-    )
-    temperature: SearchRange = field(
-        default_factory=lambda: SearchRange(0.02, 0.2, log=True)
-    )
-    min_item_reads: SearchRange = field(
-        default_factory=lambda: SearchRange(2, 20, integer=True)
-    )
-
-
-@dataclass(frozen=True)
 class TwoTowerConfig:
     """Two-tower de Covington (2016) con la pérdida de Yi (2019).
 
-    El study elige dimensión, learning rate, temperatura y el mínimo de
-    lecturas de un perfume. La época sale de la validación: NDCG@10 del último
-    fold rolling, con patience. `recent_reads` suma a la torre de lector el
-    promedio de sus últimas lecturas (0 lo apaga). `user_authors` suma el
-    promedio de los autores.
+    La época sale de la validación: NDCG@10 del último fold rolling, con
+    patience. `recent_reads` suma a la torre de lector el promedio de sus
+    últimas lecturas (0 lo apaga). `user_authors` suma el promedio de los autores.
+    Un JSON guardado pisa dimensión, learning rate, temperatura y el mínimo
+    de lecturas. two_stage no vuelve a buscarlos: solo elige el peso.
     """
 
     embedding_dim: int = 64
@@ -374,7 +269,6 @@ class TwoTowerConfig:
     max_epochs: int = 30
     patience: int = 3
     min_item_reads: int = 5
-    search: TwoTowerSearch = field(default_factory=TwoTowerSearch)
 
     def __post_init__(self) -> None:
         if min(self.embedding_dim, self.batch_size, self.max_epochs, self.patience) < 1:
@@ -445,6 +339,10 @@ class PipelineConfig:
     als: AlsConfig = field(default_factory=AlsConfig)
     bpr: BprConfig = field(default_factory=BprConfig)
     tfidf: TfidfConfig = field(default_factory=TfidfConfig)
+
+    def __post_init__(self) -> None:
+        if self.model != "two_stage":
+            raise ValueError("El único modelo es two_stage")
 
     def as_dict(self) -> dict[str, Any]:
         """Devuelve una representación apta para JSON."""

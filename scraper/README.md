@@ -98,35 +98,6 @@ residencial.
 `status` lee del frontier en SQLite, así que refleja el estado real y sobrevive
 a los reinicios.
 
-#### Dashboard (Maple / OpenTelemetry)
-
-El monitor es [Maple](https://maple.dev/) en local, no Grafana. El daemon emite
-métricas y logs OTLP al binario en `:4318`. Sin endpoint o con
-`OTEL_SDK_DISABLED=true` no hace nada. `fragrantica status` sigue siendo el
-snapshot de confianza.
-
-```bash
-maple start --offline          # UI en http://127.0.0.1:4318
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
-export OTEL_SERVICE_NAME=fragrantica-scraper
-# opcional; ver la sección Proxy
-export FRAGRANTICA_PROXY="http://user:pass@host:port"
-export FRAGRANTICA_SHELVES_PROXY="http://user:pass@residencial:port"
-.venv/bin/fragrantica daemon
-```
-
-En la UI: servicio **`fragrantica-scraper`** → **Metrics**.
-
-| Qué ver | Métrica | Agrupar por |
-|---|---|---|
-| Fallos por status code | `fragrantica.http.failures` | `status_code` y `via` (`home` / `proxy` / `shelves_proxy`) |
-| Cooldowns por fase | `fragrantica.daemon.cooldowns` | `phase` (1/2/3), `reason`, `kind` |
-| IP hogar vs proxy | `fragrantica.daemon.cooldowns` | `via` (`home` / `proxy` / `shelves_proxy`) |
-| Duración de cooldown | `fragrantica.daemon.cooldown.duration` | `phase`, `via` |
-| Logs de consola | pestaña Logs | `service.name=fragrantica-scraper` |
-
-Una fase one-shot puede emitir con `fragrantica phase 2 --otel`.
-
 ## Interrupciones y reanudación
 
 El estado del crawl vive en `data/frontier.db`, commiteado transaccionalmente.
@@ -209,16 +180,6 @@ sostenida**, algo que un burst corto de prueba no detecta:
 
 `daemon` es el modo para terminar el slice. Cómo enrutar HTML y wardrobe
 está en [Proxy](#proxy).
-
-## Tests
-
-```bash
-.venv/bin/python -m pytest tests/ -q   # ~125 tests, ~3s, sin red
-```
-
-Los parsers se testean contra HTML congelado en `tests/fixtures/`. Son
-importantes: el sitio va a cambiar el markup en algún momento, y conviene que
-los parsers fallen en CI y no a mitad de un crawl de 15 horas.
 
 ## Notas de implementación
 

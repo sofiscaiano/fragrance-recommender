@@ -3,7 +3,7 @@
 Retrieval ya eligió los libros. Acá cada candidato se describe con scores de
 las fuentes, estadísticas de lector e ítem, afinidad de autor y género, y
 señales de la secuencia de lectura. El género del lector entra como 1 (mujer)
-o 0 (hombre). Un modelo único, sin etapa de retrieval, no usa este archivo.
+o 0 (hombre).
 """
 
 from __future__ import annotations

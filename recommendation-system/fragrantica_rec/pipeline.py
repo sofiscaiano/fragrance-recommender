@@ -47,30 +47,6 @@ from .two_stage.retrieval import (
 
 LOGGER = logging.getLogger(__name__)
 
-_TWO_STAGE_DIAGNOSTICS = (
-    "retrieval_folds.csv",
-    "feature_ablations.csv",
-    "feature_importance.csv",
-    "evaluated_pipeline.joblib",
-    "final_pipeline.joblib",
-)
-
-
-def clear_foreign_diagnostics(artifacts: Path, model: str) -> None:
-    """Quita diagnósticos de two_stage cuando corre otro modelo.
-
-    No borra ``tuned_hyperparameters.json`` ni ``tuning_history.json``:
-    two_stage vuelve a buscar ahí un tuneo de la misma config.
-    """
-
-    if model == "two_stage":
-        return
-    directory = Path(artifacts)
-    for name in _TWO_STAGE_DIAGNOSTICS:
-        path = directory / name
-        if path.is_file():
-            path.unlink()
-
 
 @dataclass(frozen=True)
 class FoldMaterial:
@@ -432,7 +408,7 @@ def evaluate(
         report, trained = _evaluate(config, tune=tune, save_artifacts=save_artifacts)
         log_evaluation(report)
         if save_artifacts:
-            log_summary_artifacts(Path(config.artifacts_dir), model=config.model)
+            log_summary_artifacts(Path(config.artifacts_dir))
         return report, trained
 
 
@@ -442,17 +418,17 @@ def _evaluate(
     tune: bool,
     save_artifacts: bool,
 ) -> tuple[EvaluationReport, TrainedPipeline | None]:
-    """Corre el modelo sobre el hold-out y, si corresponde, escribe artifacts/."""
+    """Corre two_stage sobre el hold-out y, si corresponde, escribe artifacts/."""
 
-    from .models import build_model
-
+    if config.model != "two_stage":
+        raise ValueError("El único modelo es two_stage")
     split = load_split(config, holdout=True)
     LOGGER.info(
         "Holdout listo: %s usuarios y %s interacciones de test",
         len(split.evaluation_users),
         len(split.test),
     )
-    model = build_model(config.model, config)
+    model = TwoStage(config)
     model.fit(split, tune=tune)
     recommendations = model.recommend(split.evaluation_users)
     LOGGER.info("Ranking del holdout completado")
@@ -487,7 +463,6 @@ def _evaluate(
 
         artifacts = Path(config.artifacts_dir)
         artifacts.mkdir(parents=True, exist_ok=True)
-        clear_foreign_diagnostics(artifacts, config.model)
         write_run_marker(artifacts)
         (artifacts / "config.json").write_text(
             json.dumps(with_run_name(config.as_dict()), ensure_ascii=False, indent=2),

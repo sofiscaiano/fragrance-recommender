@@ -15,7 +15,7 @@ from fragrantica_rec.pipeline import evaluate as evaluate_pipeline
 from fragrantica_rec.serving import export_serving_artifact
 
 app = typer.Typer(
-    help="Recomendador de perfumes. --model elige two_stage, popularity o una fuente",
+    help="Recomendador de perfumes en dos etapas",
     invoke_without_command=True,
 )
 
@@ -50,16 +50,6 @@ LabelGainOption = Annotated[
         help=(
             "Ganancia de LambdaRank: linear (0..5) o exponential (2^rel-1). "
             "Sin el flag se usa RankerConfig.label_gain. Cambiarla exige --tune"
-        ),
-    ),
-]
-ModelOption = Annotated[
-    str | None,
-    typer.Option(
-        "--model",
-        help=(
-            "Algoritmo: two_stage, popularity, item_cosine, als, bpr, tfidf, "
-            "ease o two_tower. Sin el flag se usa PipelineConfig.model"
         ),
     ),
 ]
@@ -100,11 +90,10 @@ def _config(
     seed: int | None,
     note: str,
     label_gain: str | None,
-    model: str | None,
     two_tower_source: bool | None = None,
     ease_source: bool | None = None,
 ) -> PipelineConfig:
-    """Arma la config de la corrida con las rutas, la nota y el modelo."""
+    """Arma la config de la corrida con las rutas y la nota."""
 
     base = PipelineConfig()
     retrieval = base.retrieval
@@ -125,8 +114,6 @@ def _config(
     )
     if seed is not None:
         config = replace(config, random_seed=seed)
-    if model is not None:
-        config = replace(config, model=model)
     return config
 
 
@@ -138,7 +125,6 @@ def _run(
     seed: int | None,
     note: str,
     label_gain: str | None,
-    model: str | None,
     two_tower_source: bool | None = None,
     ease_source: bool | None = None,
 ) -> None:
@@ -153,18 +139,14 @@ def _run(
         seed,
         note,
         label_gain,
-        model,
         two_tower_source,
         ease_source,
     )
     logger = logging.getLogger(__name__)
-    if config.model == "two_stage":
-        logger.info(
-            "Modelo two_stage. Fuentes: %s",
-            ", ".join(config.retrieval.enabled_sources()),
-        )
-    else:
-        logger.info("Modelo %s", config.model)
+    logger.info(
+        "Modelo two_stage. Fuentes: %s",
+        ", ".join(config.retrieval.enabled_sources()),
+    )
     logger.info(
         "Comando evaluate (tune=%s, seed=%s, label_gain=%s). Log en %s",
         tune,
@@ -185,7 +167,6 @@ def main(
     seed: SeedOption = None,
     note: NoteOption = "",
     label_gain: LabelGainOption = None,
-    model: ModelOption = None,
 ) -> None:
     """Sin subcomando, evalúa. two_stage reutiliza el último tuneo."""
 
@@ -197,7 +178,6 @@ def main(
             seed=seed,
             note=note,
             label_gain=label_gain,
-            model=model,
         )
 
 
@@ -209,7 +189,6 @@ def evaluate(
     seed: SeedOption = None,
     note: NoteOption = ...,
     label_gain: LabelGainOption = None,
-    model: ModelOption = None,
     two_tower_source: TwoTowerSourceOption = None,
     ease_source: EaseSourceOption = None,
 ) -> None:
@@ -222,7 +201,6 @@ def evaluate(
         seed=seed,
         note=note,
         label_gain=label_gain,
-        model=model,
         two_tower_source=two_tower_source,
         ease_source=ease_source,
     )
@@ -246,7 +224,6 @@ def export_serving(
         seed,
         note="export serving",
         label_gain=None,
-        model="two_stage",
     )
     path = export_serving_artifact(config)
     print(path)

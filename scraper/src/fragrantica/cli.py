@@ -18,7 +18,6 @@ from rich.table import Table
 from .config import CRAWL, DATA_DIR, DATASET
 from .frontier import Frontier
 from .http_client import Client, probe_site
-from .observability import setup_otel
 from .pipeline.consolidate import consolidate
 from .pipeline.daemon import forget_cooldown, run_daemon
 from .pipeline.runner import StopCrawl, queue_progress
@@ -134,12 +133,9 @@ def phase(
     limit: int = typer.Option(0, help="0 = sin limite"),
     data_dir: Path = typer.Option(DATA_DIR),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
-    otel: bool = typer.Option(False, "--otel", help="Emitir metricas OTLP (OTEL_EXPORTER_OTLP_ENDPOINT)"),
 ) -> None:
     """Corre una fase individual. Reanudable: reejecutar retoma donde quedo."""
     _setup(verbose)
-    if otel:
-        setup_otel()
     staging, final, db = _paths(data_dir)
 
     async def run() -> None:
@@ -373,7 +369,6 @@ def daemon(
     indice A-Z y encola el resto del catalogo.
     """
     _setup(verbose)
-    setup_otel()
     staging, _, db = _paths(data_dir)
     if CRAWL.shelves_proxies:
         console.print(

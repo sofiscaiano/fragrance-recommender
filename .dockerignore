@@ -10,5 +10,4 @@ recommendation-system/mlflow.db
 recommendation-system/artifacts
 scraper/data
 web/dist
-slides/node_modules
 .git
