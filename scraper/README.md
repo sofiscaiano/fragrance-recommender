@@ -134,8 +134,7 @@ data/
     ├── users.parquet
     ├── interactions.parquet
     ├── dataset_card.md            # conteos, sparsity, limitaciones
-    ├── report.json
-    └── PRIVATE_user_mapping.parquet   # NO publicar ni versionar
+    └── report.json
 ```
 
 El staging se guarda **sin filtrar** a propósito: permite regenerar el dataset

@@ -38,13 +38,3 @@ Quedan en `artifacts/`. `evaluation.json` tiene el NDCG@10 del modelo y el de la
 ```bash
 uv run mlflow ui --backend-store-uri sqlite:///mlflow.db
 ```
-
-## Página
-
-La página no entrena. Este comando ajusta las fuentes sobre todo el historial y reusa el LambdaRank de la última evaluación:
-
-```bash
-uv run python main.py export-serving
-```
-
-Escribe `artifacts/serving.joblib`. Hace falta `artifacts/evaluated_pipeline.joblib`. Cómo levantarlo con la web está en `../serving/README.md`.

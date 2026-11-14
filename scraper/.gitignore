@@ -4,7 +4,5 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# El crawl entero: frontier, staging y el dataset. En particular
-# data/final/PRIVATE_user_mapping.parquet es el mapeo reversible
-# hash -> username y no debe versionarse.
+# Crawl, staging y dataset. Quedan solo en la máquina local.
 data/
