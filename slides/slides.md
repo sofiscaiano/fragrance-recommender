@@ -235,25 +235,6 @@ layout: none
 ---
 
 <div class="frame">
-  <p class="kicker">Bitácora</p>
-  <h1 class="title sm">Experimentos realizados</h1>
-  <div class="log">
-    <div class="log-item"><em>01</em><div><b>Popularidad</b><span>Una lista común para todos los usuarios, con recencia, para tener de baseline.</span></div></div>
-    <div class="log-item"><em>02</em><div><b>Fuentes individuales</b><span>Se experimento con ALS, ítem-kNN, EASE y un two-tower, cada uno con su grilla de hiperparámetros.</span></div></div>
-    <div class="log-item"><em>03</em><div><b>Contenido</b><span>El two-tower se probó también solo con ids de items, para ver si las notas y acordes de los items aportaban.</span></div></div>
-    <div class="log-item"><em>04</em><div><b>Two-stage</b><span>Las distintas fuentes se fusionan con RRF y LGBMRanker.</span></div></div>
-  </div>
-</div>
-
-<!--
-Primero el piso de popularidad, después cada fuente por separado, después la torre sin el texto del fragancia, y al final la fusión. El tuneo no mira el holdout: ese queda para la medición final.
--->
-
----
-layout: none
----
-
-<div class="frame">
   <p class="kicker">Modelo · dos etapas</p>
   <h1 class="title sm">El retrieval trae candidatos. LGBMRanker los ordena.</h1>
   <div class="stages">
@@ -534,6 +515,28 @@ layout: none
 
 <!--
 La importancia es la ganancia de LightGBM en la corrida 20261113-153541. El 58% cae en las fuentes. Después el año del fragancia, las transiciones y la marca. Usuario, estadísticas del fragancia y familia pesan menos. Género y edad del usuario quedan en cero porque el perfil no los trae.
+-->
+
+---
+layout: none
+---
+
+<div class="frame">
+  <p class="kicker">Bitácora</p>
+  <h1 class="title sm">Experimentos realizados</h1>
+  <div class="log">
+    <div class="log-item"><em>01</em><div><b>Popularidad</b><span>Una lista común para todos los usuarios, con recencia, para tener de baseline.</span></div></div>
+    <div class="log-item"><em>02</em><div><b>Fuentes individuales</b><span>Se experimento con ALS, ítem-kNN, EASE y un two-tower, cada uno con su grilla de hiperparámetros.</span></div></div>
+    <div class="log-item"><em>03</em><div><b>Contenido</b><span>El two-tower se probó también solo con ids de items, para ver si las notas y acordes de los items aportaban.</span></div></div>
+    <div class="log-item"><em>04</em><div><b>Two-stage</b><span>Las distintas fuentes se fusionan con RRF y LGBMRanker.</span></div></div>
+    <div class="log-item"><em>05</em><div><b>Ganancia</b><span>En LambdaRank se probó la ganancia lineal y la exponencial. La exponencial es 2^nota − 1, la misma que usa el NDCG al medir.</span></div></div>
+    <div class="log-item"><em>06</em><div><b>Pool</b><span>Con el ranker ya entrenado, se achicó el pool por debajo del corte del RRF para ver si subía el NDCG.</span></div></div>
+    <div class="log-item"><em>07</em><div><b>Ablación</b><span>Se sacó cada fuente del retrieval y, en el ranker, el bloque de las fuentes y el de secuencia.</span></div></div>
+  </div>
+</div>
+
+<!--
+Primero el piso de popularidad, después cada fuente por separado, después la torre sin el texto del fragancia, y al final la fusión. En LambdaRank se comparó la ganancia lineal con la exponencial: el NDCG de la métrica ya es exponencial, y alinear el entrenamiento con eso es el label_gain. Con el ranker fijo se achicó el pool. La ablación saca una fuente del retrieval, o un grupo de features del ranker. El tuneo no mira el holdout: ese queda para la medición final.
 -->
 
 ---

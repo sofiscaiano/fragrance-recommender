@@ -2627,8 +2627,8 @@ h1.title.tight {
   display: grid;
   grid-template-columns: 1fr 1fr;
   align-content: space-evenly;
-  gap: 10px 28px;
-  margin-top: 8px;
+  gap: 8px 28px;
+  margin-top: 6px;
   flex: 1;
 }
 
