@@ -58,7 +58,7 @@ class PopularityModel:
         self._history = split.history
 
     def recommend(self, users: tuple[str, ...] | list[str]) -> pd.DataFrame:
-        """Top-20 global, saltando lo que cada lector ya leyó."""
+        """Top-10 global, saltando lo que cada lector ya leyó."""
 
         return self._model.recommend(users, self._history, n=10)
 

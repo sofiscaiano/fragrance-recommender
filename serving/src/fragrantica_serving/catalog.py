@@ -6,7 +6,7 @@ import json
 import os
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -16,7 +16,9 @@ from fragrantica_serving.ranking import (
     PAGE_SIZE,
     TREND_WINDOW_SECONDS,
     Item,
+    PerfumeNote,
     Preferences,
+    Relation,
     Tab,
     counts_for_floor,
     percentile_75,
@@ -49,6 +51,10 @@ class Options:
     families: tuple[str, ...]
 
 
+WARDROBE_LIMIT = 60
+_RELATION_ORDER = {"have": 0, "want": 1, "had": 2}
+
+
 @dataclass(frozen=True)
 class Recommendation:
     username: str
@@ -56,6 +62,7 @@ class Recommendation:
     avatar_url: str | None
     tab: Tab
     perfumes: list[Item]
+    relations: dict[int, str] = field(default_factory=dict)
 
 
 class ModelUnavailable(RuntimeError):
@@ -82,10 +89,14 @@ class Catalog:
         seen: Mapping[int, set[int]],
         recent_counts: Mapping[int, int] | None = None,
         personal: PersonalRanking | None = None,
+        wardrobe: Mapping[int, Sequence[tuple[int, Relation]]] | None = None,
     ) -> None:
         self.items = items
         self.profiles = dict(profiles)
         self.seen = seen
+        self.wardrobe = {
+            member_id: list(rows) for member_id, rows in (wardrobe or {}).items()
+        }
         self.recent_counts = dict(recent_counts or {})
         self.vote_floor = percentile_75(counts_for_floor(items))
         self.options = _options(items)
@@ -115,10 +126,18 @@ class Catalog:
         exclude = set(ratings)
         if found.member_id is not None:
             exclude.update(self.seen.get(found.member_id, ()))
-        if tab == "para_vos":
-            perfumes = self._personal(found.member_id, exclude, notas or {})
+        notas_pedido = dict(notas or {})
+        relations: dict[int, str] = {}
+        if tab == "wardrobe":
+            perfumes, relations = self._wardrobe(found.member_id, preferences)
+        elif tab == "para_vos":
+            if found.member_id is None:
+                for liked in preferences.liked:
+                    notas_pedido.setdefault(liked.perfume_id, 5)
+                    exclude.add(liked.perfume_id)
+            perfumes = self._personal(found.member_id, exclude, notas_pedido)
         else:
-            # La encuesta es solo para quien no está en el dataset.
+            # La encuesta de marcas es solo para quien no está en el dataset.
             active = Preferences() if found.conocido else preferences
             perfumes = rank_items(
                 self.items,
@@ -134,6 +153,7 @@ class Catalog:
             avatar_url=found.avatar_url,
             tab=tab,
             perfumes=perfumes,
+            relations=relations,
         )
 
     def _personal(
@@ -166,6 +186,45 @@ class Catalog:
                 break
         return chosen
 
+    def search_perfumes(self, query: str, limit: int = 8) -> list[Item]:
+        """Perfumes cuyo nombre o marca contiene el texto, los más reseñados primero."""
+
+        needle = query.strip().casefold()
+        if len(needle) < 2 or limit < 1:
+            return []
+        hits = [
+            item
+            for item in self.items
+            if needle in item.name.casefold() or needle in item.brand.casefold()
+        ]
+        hits.sort(key=lambda item: (-item.rating_count, item.name.casefold()))
+        return hits[:limit]
+
+    def _wardrobe(
+        self,
+        member_id: int | None,
+        preferences: Preferences,
+    ) -> tuple[list[Item], dict[int, str]]:
+        """Colección guardada. En un perfil nuevo, la de la encuesta."""
+
+        by_id = {item.perfume_id: item for item in self.items}
+        if member_id is None:
+            rows = [(liked.perfume_id, liked.relation) for liked in preferences.liked]
+        else:
+            rows = list(self.wardrobe.get(member_id, ()))
+        chosen: list[Item] = []
+        relations: dict[int, str] = {}
+        ordered = sorted(rows, key=lambda row: (_RELATION_ORDER.get(row[1], 9), row[0]))
+        for perfume_id, relation in ordered:
+            item = by_id.get(perfume_id)
+            if item is None or perfume_id in relations:
+                continue
+            relations[perfume_id] = relation
+            chosen.append(item)
+            if len(chosen) == WARDROBE_LIMIT:
+                break
+        return chosen, relations
+
 
 def data_dir() -> Path:
     raw = os.environ.get("FRAGRANTICA_DATA")
@@ -192,17 +251,18 @@ def load_catalog(directory: Path | None = None) -> Catalog:
         items = _load_items(con, root / "items.parquet")
         profiles = _load_profiles(con, root)
         seen = _load_seen(con, root)
+        wardrobe = _load_wardrobe(con, root / "wardrobe.parquet")
         recent_counts = _load_recent_counts(con, root / "interactions.parquet")
     finally:
         con.close()
-    return Catalog(items, profiles, seen, recent_counts)
+    return Catalog(items, profiles, seen, recent_counts, wardrobe=wardrobe)
 
 
 def _load_items(con: duckdb.DuckDBPyConnection, path: Path) -> list[Item]:
     rows = con.execute(
         """
         SELECT perfume_id, url, name, brand, gender, launch_year, olfactive_family,
-               perfumers, rating_value, rating_count, image_url, description
+               perfumers, rating_value, rating_count, image_url, description, notes
         FROM read_parquet(?)
         """,
         [str(path)],
@@ -222,6 +282,7 @@ def _load_items(con: duckdb.DuckDBPyConnection, path: Path) -> list[Item]:
             rating_count,
             image_url,
             description,
+            notes,
         ) = row
         if perfume_id is None or rating_value is None or rating_count is None:
             continue
@@ -239,6 +300,7 @@ def _load_items(con: duckdb.DuckDBPyConnection, path: Path) -> list[Item]:
                 description=_text(description),
                 image_url=_text(image_url),
                 url=_text(url),
+                notes=_notes(notes),
             )
         )
     return items
@@ -301,6 +363,34 @@ def _load_recent_counts(con: duckdb.DuckDBPyConnection, path: Path) -> dict[int,
     return counts
 
 
+def _load_wardrobe(
+    con: duckdb.DuckDBPyConnection,
+    path: Path,
+) -> dict[int, list[tuple[int, Relation]]]:
+    """Una fila por perfume. Si hay varias, queda tiene, después quiere, después tuvo."""
+
+    best: dict[int, dict[int, Relation]] = defaultdict(dict)
+    for member_id, perfume_id, relation in con.execute(
+        """
+        SELECT member_id, perfume_id, relation
+        FROM read_parquet(?)
+        WHERE relation IN ('have', 'want', 'had')
+        """,
+        [str(path)],
+    ).fetchall():
+        if member_id is None or perfume_id is None or relation not in _RELATION_ORDER:
+            continue
+        member = int(member_id)
+        perfume = int(perfume_id)
+        current = best[member].get(perfume)
+        if current is None or _RELATION_ORDER[relation] < _RELATION_ORDER[current]:
+            best[member][perfume] = relation
+    return {
+        member: list(rows.items())
+        for member, rows in best.items()
+    }
+
+
 def _load_seen(con: duckdb.DuckDBPyConnection, root: Path) -> dict[int, set[int]]:
     seen: dict[int, set[int]] = defaultdict(set)
     query = """
@@ -345,6 +435,34 @@ def _options(items: Iterable[Item]) -> Options:
         perfumers=tuple(sorted(perfumers, key=str.casefold)),
         families=tuple(sorted(families, key=str.casefold)),
     )
+
+
+_NOTE_LEVELS = {"top", "middle", "base", "single"}
+
+
+def _notes(raw: object) -> tuple[PerfumeNote, ...]:
+    if raw is None:
+        return ()
+    data: object = raw
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return ()
+    if not isinstance(data, list):
+        return ()
+    notes: list[PerfumeNote] = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        level = entry.get("level")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if level not in _NOTE_LEVELS:
+            level = "single"
+        notes.append(PerfumeNote(name=name.strip(), level=level))
+    return tuple(notes)
 
 
 def _perfumers(raw: object) -> tuple[str, ...]:

@@ -6,9 +6,10 @@ import logging
 import os
 import time
 from collections.abc import AsyncIterator, Iterable
+from typing import Literal
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
@@ -19,7 +20,7 @@ from fragrantica_serving.catalog import (
     data_dir,
     load_catalog,
 )
-from fragrantica_serving.ranking import Item, Preferences, Tab
+from fragrantica_serving.ranking import Item, LikedPerfume, Preferences, Tab
 
 LOGGER = logging.getLogger("uvicorn.error")
 
@@ -29,18 +30,31 @@ class RatingIn(BaseModel):
     rating: int = Field(ge=1, le=5)
 
 
+class LikedIn(BaseModel):
+    perfume_id: int = Field(gt=0)
+    relation: Literal["have", "want", "had"]
+
+
 class PreferencesIn(BaseModel):
     brands: list[str] = Field(default_factory=list)
     genders: list[str] = Field(default_factory=list)
     perfumers: list[str] = Field(default_factory=list)
     families: list[str] = Field(default_factory=list)
+    liked: list[LikedIn] = Field(default_factory=list, max_length=5)
 
     def to_domain(self) -> Preferences:
+        seen: dict[int, LikedIn] = {}
+        for liked in self.liked:
+            seen[liked.perfume_id] = liked
         return Preferences(
             brands=_choices(self.brands),
             genders=_choices(self.genders),
             perfumers=_choices(self.perfumers),
             families=_choices(self.families),
+            liked=tuple(
+                LikedPerfume(perfume_id=liked.perfume_id, relation=liked.relation)
+                for liked in seen.values()
+            ),
         )
 
 
@@ -75,6 +89,17 @@ class OptionsOut(BaseModel):
     families: list[str]
 
 
+class PerfumeHitOut(BaseModel):
+    perfume_id: int
+    name: str
+    brand: str
+
+
+class NoteOut(BaseModel):
+    name: str
+    level: Literal["top", "middle", "base", "single"]
+
+
 class PerfumeOut(BaseModel):
     perfume_id: int
     name: str
@@ -82,6 +107,7 @@ class PerfumeOut(BaseModel):
     gender: str
     olfactive_family: str
     perfumers: list[str]
+    notes: list[NoteOut]
     launch_year: int | None
     rating_value: float
     rating_count: int
@@ -89,6 +115,7 @@ class PerfumeOut(BaseModel):
     image_url: str
     url: str
     rank: int
+    relation: str | None = None
 
 
 class RecommendOut(BaseModel):
@@ -118,7 +145,7 @@ def _catalog(request: Request) -> Catalog:
     return catalog
 
 
-def _perfume_out(item: Item, rank: int) -> PerfumeOut:
+def _perfume_out(item: Item, rank: int, relation: str | None = None) -> PerfumeOut:
     return PerfumeOut(
         perfume_id=item.perfume_id,
         name=item.name,
@@ -126,6 +153,7 @@ def _perfume_out(item: Item, rank: int) -> PerfumeOut:
         gender=item.gender,
         olfactive_family=item.olfactive_family,
         perfumers=list(item.perfumers),
+        notes=[NoteOut(name=note.name, level=note.level) for note in item.notes],
         launch_year=item.launch_year,
         rating_value=item.rating_value,
         rating_count=item.rating_count,
@@ -133,6 +161,7 @@ def _perfume_out(item: Item, rank: int) -> PerfumeOut:
         image_url=item.image_url,
         url=item.url,
         rank=rank,
+        relation=relation,
     )
 
 
@@ -142,7 +171,10 @@ def _recommend_out(result: Recommendation) -> RecommendOut:
         conocido=result.conocido,
         avatar_url=result.avatar_url,
         tab=result.tab,
-        perfumes=[_perfume_out(item, index) for index, item in enumerate(result.perfumes, start=1)],
+        perfumes=[
+            _perfume_out(item, index, result.relations.get(item.perfume_id))
+            for index, item in enumerate(result.perfumes, start=1)
+        ],
     )
 
 
@@ -185,6 +217,14 @@ def create_app(catalog: Catalog | None = None) -> FastAPI:
             families=list(options.families),
         )
 
+    @app.get("/perfumes", response_model=list[PerfumeHitOut])
+    def perfumes(request: Request, q: str = Query(default="")) -> list[PerfumeHitOut]:
+        hits = _catalog(request).search_perfumes(q)
+        return [
+            PerfumeHitOut(perfume_id=item.perfume_id, name=item.name, brand=item.brand)
+            for item in hits
+        ]
+
     @app.post("/sesion", response_model=SessionOut)
     def sesion(body: SessionIn, request: Request) -> SessionOut:
         found = _catalog(request).session(body.username)
@@ -224,4 +264,8 @@ app = create_app()
 def main() -> None:
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("PORT", "8000")))
+    uvicorn.run(
+        app,
+        host=os.environ.get("HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "8000")),
+    )

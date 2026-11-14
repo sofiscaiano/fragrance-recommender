@@ -1,10 +1,10 @@
 """Fuentes clásicas como modelos de una etapa, cada una con su study.
 
-`item_cosine`, `als`, `bpr` y `tfidf` se tunean solas, con el NDCG@20 del
+`item_cosine`, `als`, `bpr` y `tfidf` se tunean solas, con el NDCG@10 del
 último fold, y dejan su JSON. `two_stage` lee ese archivo para armar la
 fuente y no lo pisa: en la fusión solo elige el peso. El retriever que entra
 a la fusión no rellena con popularidad; el modelo de una etapa sí, igual que
-EASE, para que el top-20 esté completo.
+EASE, para que el top-10 esté completo.
 """
 
 from __future__ import annotations
@@ -189,7 +189,7 @@ def tune_source(
     books: pd.DataFrame,
     config: PipelineConfig,
 ) -> SourceParameters:
-    """Elige los hiperparámetros de una fuente maximizando el NDCG@20 del último fold."""
+    """Elige los hiperparámetros de una fuente maximizando el NDCG@10 del último fold."""
 
     _check_name(name)
     try:
@@ -209,7 +209,7 @@ def tune_source(
     vectorizers: dict[int, TfidfRetriever] = {}
 
     def objective(trial: Any) -> float:
-        """NDCG@20 del último fold. El vectorizer de TF-IDF se reusa si solo cambia la semivida."""
+        """NDCG@10 del último fold. El vectorizer de TF-IDF se reusa si solo cambia la semivida."""
 
         parameters = _from_suggestion(name, search, trial)
         retriever = _fit_for_trial(
@@ -380,7 +380,7 @@ class SourceModel:
         _log_selected(self.name, parameters, self.hyperparameters_origin)
 
     def recommend(self, users: tuple[str, ...] | list[str]) -> pd.DataFrame:
-        """Top-20, sin libros ya leídos. Popularidad completa si la fuente no llega."""
+        """Top-10, sin libros ya leídos. Popularidad completa si la fuente no llega."""
 
         if self._history is None or self._retriever is None or self._popularity is None:
             raise RuntimeError("El modelo debe entrenarse antes de recomendar")

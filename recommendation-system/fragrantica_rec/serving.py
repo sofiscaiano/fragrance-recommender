@@ -43,7 +43,7 @@ LOGGER = logging.getLogger(__name__)
 
 SERVING_FILENAME = "serving.joblib"
 EVALUATED_FILENAME = "evaluated_pipeline.joblib"
-TOP_N = 20
+TOP_N = 10
 
 
 @dataclass

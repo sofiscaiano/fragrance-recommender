@@ -162,7 +162,7 @@ def test_tune_writes_only_that_source_file(tmp_path, model: str) -> None:
     seen = set(frame.loc[frame["member_id"] == "u1", "perfume_id"])
     assert ranking["perfume_id"].tolist()
     assert set(ranking["perfume_id"]).isdisjoint(seen)
-    assert len(ranking) <= 20
+    assert len(ranking) <= 10
 
 
 def test_reader_without_history_follows_popularity(tmp_path) -> None:

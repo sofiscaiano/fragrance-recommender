@@ -1,0 +1,14 @@
+**/.venv
+**/node_modules
+**/__pycache__
+**/.pytest_cache
+**/.mypy_cache
+**/*.pyc
+recommendation-system/mlartifacts
+recommendation-system/mlruns
+recommendation-system/mlflow.db
+recommendation-system/artifacts
+scraper/data
+web/dist
+slides/node_modules
+.git

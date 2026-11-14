@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from fragrantica_serving.app import create_app
 from fragrantica_serving.catalog import Catalog, Profile, load_catalog
-from fragrantica_serving.ranking import Item, Preferences
+from fragrantica_serving.ranking import Item, LikedPerfume, Preferences
 
 
 def perfume(
@@ -131,6 +131,66 @@ def test_para_vos_usa_la_nota_y_no_aplica_el_piso_ni_la_encuesta() -> None:
     assert result.tab == "para_vos"
 
 
+def test_nuevo_arma_para_vos_con_los_cinco_y_el_wardrobe_con_la_relacion() -> None:
+    class Recorder:
+        def __init__(self) -> None:
+            self.ratings: list[tuple[int, int]] = []
+            self.exclude: set[int] = set()
+
+        def rank(
+            self,
+            member_id: int | None,
+            ratings: list[tuple[int, int]],
+            exclude: set[int],
+        ) -> list[int]:
+            self.ratings = list(ratings)
+            self.exclude = set(exclude)
+            return [2, 1, 3]
+
+    loaded = catalog()
+    recorder = Recorder()
+    loaded.personal = recorder
+    liked = (
+        LikedPerfume(1, "have"),
+        LikedPerfume(3, "want"),
+    )
+    preferences = Preferences(liked=liked)
+    ranked = loaded.recommend("nadie", "para_vos", [1], preferences, {1: 4})
+    assert recorder.ratings == [(1, 4), (3, 5)]
+    assert recorder.exclude == {1, 3}
+    assert [item.perfume_id for item in ranked.perfumes] == [2]
+
+    wardrobe = loaded.recommend("nadie", "wardrobe", [], preferences)
+    assert [(item.perfume_id, wardrobe.relations[item.perfume_id]) for item in wardrobe.perfumes] == [
+        (1, "have"),
+        (3, "want"),
+    ]
+
+
+def test_conocido_muestra_su_wardrobe_y_no_usa_la_encuesta() -> None:
+    loaded = Catalog(
+        catalog().items,
+        catalog().profiles,
+        {7: {1}},
+        wardrobe={7: [(3, "had"), (2, "have")]},
+    )
+    result = loaded.recommend(
+        "ada",
+        "wardrobe",
+        [],
+        Preferences(liked=(LikedPerfume(1, "want"),)),
+    )
+    assert [(item.perfume_id, result.relations[item.perfume_id]) for item in result.perfumes] == [
+        (2, "have"),
+        (3, "had"),
+    ]
+
+
+def test_buscar_perfumes_por_nombre_o_marca() -> None:
+    hits = catalog().search_perfumes("dio")
+    assert [item.perfume_id for item in hits] == [2]
+
+
 def test_desconocido_aplica_la_encuesta() -> None:
     result = catalog().recommend(
         "Nadie",
@@ -196,13 +256,14 @@ def test_load_catalog_lee_parquet_sin_el_hash(tmp_path: Path) -> None:
         """
         SELECT * FROM (VALUES
           (1, 'http://a', 'Alpha', 'Chanel', 'women', 2020, 'Floral', '["Alberto Morillas"]',
-           4.5, 100, 'http://img/1', 'texto'),
+           4.5, 100, 'http://img/1', 'texto',
+           '[{"name":"Bergamot","level":"top"},{"name":"Rose","level":"middle"},{"name":"Musk","level":"base"}]'),
           (2, 'http://b', 'Beta', 'Dior', 'men', 2019, 'Woody', '["Otro"]',
-           4.2, 50, 'http://img/2', 'texto'),
+           4.2, 50, 'http://img/2', 'texto', '[]'),
           (3, 'http://c', 'Bajo', 'Chanel', 'women', 2018, 'Floral', '["Alberto Morillas"]',
-           2.0, 9999, 'http://img/3', 'texto')
+           2.0, 9999, 'http://img/3', 'texto', NULL)
         ) t(perfume_id, url, name, brand, gender, launch_year, olfactive_family, perfumers,
-             rating_value, rating_count, image_url, description)
+             rating_value, rating_count, image_url, description, notes)
         """,
         tmp_path / "items.parquet",
     )
@@ -231,7 +292,13 @@ def test_load_catalog_lee_parquet_sin_el_hash(tmp_path: Path) -> None:
     )
     _copy(
         con,
-        "SELECT * FROM (VALUES (7, 2)) t(member_id, perfume_id)",
+        """
+        SELECT * FROM (VALUES
+          (7, 2, 'want'),
+          (7, 2, 'have'),
+          (7, 1, 'had')
+        ) t(member_id, perfume_id, relation)
+        """,
         tmp_path / "wardrobe.parquet",
     )
 
@@ -242,3 +309,14 @@ def test_load_catalog_lee_parquet_sin_el_hash(tmp_path: Path) -> None:
     assert result.perfumes == []
     assert "hash-secreto" not in repr(loaded.profiles)
     assert loaded.options.perfumers == ("Alberto Morillas", "Otro")
+    alpha = next(item for item in loaded.items if item.perfume_id == 1)
+    assert [(note.name, note.level) for note in alpha.notes] == [
+        ("Bergamot", "top"),
+        ("Rose", "middle"),
+        ("Musk", "base"),
+    ]
+    wardrobe = loaded.recommend("ada", "wardrobe", ratings=[], preferences=Preferences())
+    assert [(item.perfume_id, wardrobe.relations[item.perfume_id]) for item in wardrobe.perfumes] == [
+        (2, "have"),
+        (1, "had"),
+    ]

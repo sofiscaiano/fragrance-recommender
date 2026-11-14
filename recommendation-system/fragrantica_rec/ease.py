@@ -473,7 +473,7 @@ def tune_ease(
     books: pd.DataFrame,
     config: PipelineConfig,
 ) -> EaseParameters:
-    """Elige λ y el mínimo de lecturas maximizando el NDCG@20 del último fold.
+    """Elige λ y el mínimo de lecturas maximizando el NDCG@10 del último fold.
 
     Con ``tune_on_example_users`` ese NDCG mira solo los lectores de
     ``ejemplo.csv``, igual que el resto de los studies.
@@ -498,7 +498,7 @@ def tune_ease(
     search = config.ease.search
 
     def objective(trial: Any) -> float:
-        """NDCG@20 del último fold. La diagonalización se reusa si solo cambia λ."""
+        """NDCG@10 del último fold. La diagonalización se reusa si solo cambia λ."""
 
         reg_lambda = float(search.reg_lambda.suggest(trial, "reg_lambda"))
         min_interactions = int(search.min_interactions.suggest(trial, "min_interactions"))
@@ -658,7 +658,7 @@ class EaseModel:
         _log_selected(parameters, len(item_ids), self.hyperparameters_origin)
 
     def recommend(self, users: tuple[str, ...] | list[str]) -> pd.DataFrame:
-        """Top-20, sin libros ya leídos. Popularidad completa si EASE no llega."""
+        """Top-10, sin libros ya leídos. Popularidad completa si EASE no llega."""
 
         if (
             self._history is None

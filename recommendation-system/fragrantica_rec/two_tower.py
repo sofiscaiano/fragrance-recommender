@@ -7,11 +7,11 @@
 - Pérdida: softmax contra los otros libros del batch, con corrección logQ
   por popularidad y vectores normalizados con temperatura (Yi et al.,
   RecSys 2019).
-- Ejemplos: la historia anterior a un corte predice cualquiera de las 20
+- Ejemplos: la historia anterior a un corte predice cualquiera de las 10
   lecturas siguientes, como el hold-out (ventana futura de PinnerFormer,
   KDD 2022). Cada uno pesa su rating, la ganancia de ``ndcg_score``.
 
-La cantidad de épocas sale del NDCG@20 del último fold rolling. Con ella se
+La cantidad de épocas sale del NDCG@10 del último fold rolling. Con ella se
 reentrena de cero sobre toda la historia recibida.
 """
 
@@ -281,7 +281,7 @@ def recommend_frame(
     history: pd.DataFrame,
     users: list[str],
 ) -> pd.DataFrame:
-    """Top-20 del two-tower. Sin historia en el vocabulario, o si no llega a 20, popularidad."""
+    """Top-10 del two-tower. Sin historia en el vocabulario, o si no llega a 10, popularidad."""
 
     known = [user for user in users if user in sequences.position]
     picks = dict(zip(known, _top_items(net, sequences, known)[0], strict=True)) if known else {}
@@ -341,7 +341,7 @@ def train(
             continue
         users, target = validation
         ndcg = ndcg_at_k(recommend_frame(net, vocabulary, sequences, trained.popularity, history, users), target)
-        LOGGER.info("two_tower época %s: loss=%.4f val_ndcg@20=%.4f", epoch, loss, ndcg)
+        LOGGER.info("two_tower época %s: loss=%.4f val_ndcg@10=%.4f", epoch, loss, ndcg)
         if ndcg > best_ndcg:
             best_epoch, best_ndcg, stale = epoch, ndcg, 0
             continue
@@ -510,7 +510,7 @@ def tune_two_tower(
     """Elige dimensión, learning rate, temperatura y el mínimo de lecturas.
 
     Cada trial solo entrena el último fold y corta las épocas con patience.
-    El NDCG@20 es el de esa validación. El reentrenamiento con toda la historia
+    El NDCG@10 es el de esa validación. El reentrenamiento con toda la historia
     queda para el modelo final, una vez elegido el trial. Con
     ``tune_on_example_users`` la validación mira solo los lectores de
     ``ejemplo.csv``.
@@ -528,7 +528,7 @@ def tune_two_tower(
     search = config.two_tower.search
 
     def objective(trial: Any) -> float:
-        """NDCG@20 del último fold, con las épocas que elige patience."""
+        """NDCG@10 del último fold, con las épocas que elige patience."""
 
         parameters = TwoTowerParameters(
             embedding_dim=int(search.embedding_dim.suggest(trial, "embedding_dim")),
@@ -695,7 +695,7 @@ class TwoTowerModel:
         _log_to_mlflow(self.hyperparameters)
 
     def recommend(self, users: tuple[str, ...] | list[str]) -> pd.DataFrame:
-        """Top-20 sin libros ya leídos."""
+        """Top-10 sin libros ya leídos."""
 
         if self._trained is None:
             raise RuntimeError("El modelo debe entrenarse antes de recomendar")
@@ -711,8 +711,29 @@ class TwoTowerModel:
 
 
 def _log_to_mlflow(values: dict[str, object]) -> None:
+    """Registra el two-tower elegido sin pisar los parámetros de la config.
+
+    La corrida ya guardó ``two_tower.*`` al abrirse. Volver a loguearlos
+    aborta el run después del entrenamiento y se pierde el holdout.
+    """
+
     import mlflow
 
-    if mlflow.active_run() is None:
+    run = mlflow.active_run()
+    if run is None:
         return
-    mlflow.log_params({f"two_tower.{key}": value for key, value in values.items()})
+    logged = set(run.data.params)
+    params = {
+        f"two_tower_selected.{key}": value
+        for key, value in values.items()
+        if f"two_tower_selected.{key}" not in logged
+    }
+    if params:
+        mlflow.log_params(params)
+    metrics = {
+        f"two_tower_{key}": float(values[key])
+        for key in ("epochs", "validation_ndcg_at_10", "n_items")
+        if key in values
+    }
+    if metrics:
+        mlflow.log_metrics(metrics)

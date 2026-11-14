@@ -12,10 +12,18 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 MIN_RATING = 3.0
-PAGE_SIZE = 20
+PAGE_SIZE = 10
 # Ventana móvil desde la interacción fechada más nueva del dataset.
 TREND_WINDOW_SECONDS = 365 * 24 * 60 * 60
-Tab = Literal["populares", "mejor_puntuados", "trending", "para_vos"]
+Tab = Literal["populares", "mejor_puntuados", "trending", "para_vos", "wardrobe"]
+Relation = Literal["have", "want", "had"]
+NoteLevel = Literal["top", "middle", "base", "single"]
+
+
+@dataclass(frozen=True)
+class PerfumeNote:
+    name: str
+    level: NoteLevel
 
 
 @dataclass(frozen=True)
@@ -32,6 +40,15 @@ class Item:
     description: str
     image_url: str
     url: str
+    notes: tuple[PerfumeNote, ...] = ()
+
+
+@dataclass(frozen=True)
+class LikedPerfume:
+    """Un perfume elegido en la encuesta, con su lugar en el wardrobe."""
+
+    perfume_id: int
+    relation: Relation
 
 
 @dataclass(frozen=True)
@@ -40,12 +57,14 @@ class Preferences:
 
     Dentro de cada dimensión alcanza con coincidir con cualquiera.
     Entre dimensiones se cumplen todas las que tengan alguna elección.
+    ``liked`` son hasta cinco perfumes que le gustaron, con tiene / quiere / tuvo.
     """
 
     brands: frozenset[str] = field(default_factory=frozenset)
     genders: frozenset[str] = field(default_factory=frozenset)
     perfumers: frozenset[str] = field(default_factory=frozenset)
     families: frozenset[str] = field(default_factory=frozenset)
+    liked: tuple[LikedPerfume, ...] = ()
 
     def matches(self, item: Item) -> bool:
         if self.brands and item.brand not in self.brands:

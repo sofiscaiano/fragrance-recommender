@@ -152,7 +152,7 @@ def test_exclusiones_y_lista_corta() -> None:
         exclude={1, 2},
         preferences=Preferences(),
         vote_floor=0,
-        limit=20,
+        limit=10,
     )
     assert [item.perfume_id for item in ranked] == [3, 4, 5]
 

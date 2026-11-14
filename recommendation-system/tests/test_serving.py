@@ -143,8 +143,8 @@ def test_usuario_conocido_no_repide_lo_visto(
     before = model.feature_builder.user_stats_.copy()
     recommended = recommend_user(model, "u1", history)
 
-    assert len(recommended) == 20
-    assert len(set(recommended)) == 20
+    assert len(recommended) == 10
+    assert len(set(recommended)) == 10
     assert set(recommended).isdisjoint(seen)
     assert model.feature_builder.user_stats_.equals(before)
 
@@ -173,6 +173,6 @@ def test_usuario_nuevo_con_notas_no_devuelve_lo_puntuado(
     history = build_request_history(empty, "nuevo", [("p00", 5), ("p01", 4)])
     recommended = recommend_user(model, "nuevo", history)
 
-    assert len(recommended) == 20
+    assert len(recommended) == 10
     assert set(recommended) <= set(perfumes)
     assert set(recommended).isdisjoint({"p00", "p01"})

@@ -1,3 +1,8 @@
+export type PerfumeNote = {
+  name: string;
+  level: "top" | "middle" | "base" | "single";
+};
+
 export type Perfume = {
   perfume_id: number;
   name: string;
@@ -5,6 +10,7 @@ export type Perfume = {
   gender: string;
   olfactive_family: string;
   perfumers: string[];
+  notes: PerfumeNote[];
   launch_year: number | null;
   rating_value: number;
   rating_count: number;
@@ -12,6 +18,16 @@ export type Perfume = {
   image_url: string;
   url: string;
   rank: number;
+  relation: WardrobeRelation | null;
+};
+
+export type WardrobeRelation = "have" | "want" | "had";
+
+export type LikedPerfume = {
+  perfume_id: number;
+  relation: WardrobeRelation;
+  name: string;
+  brand: string;
 };
 
 export type Preferences = {
@@ -19,6 +35,13 @@ export type Preferences = {
   genders: string[];
   perfumers: string[];
   families: string[];
+  liked: LikedPerfume[];
+};
+
+export type PerfumeHit = {
+  perfume_id: number;
+  name: string;
+  brand: string;
 };
 
 export type SessionRating = {
@@ -40,14 +63,14 @@ export type OptionsResponse = {
 };
 
 export type RecommendationResponse = SessionResponse & {
-  tab: "populares" | "trending" | "mejor_puntuados" | "para_vos";
+  tab: "populares" | "trending" | "mejor_puntuados" | "para_vos" | "wardrobe";
   perfumes: Perfume[];
 };
 
 export type Tab = RecommendationResponse["tab"];
 
 export function emptyPreferences(): Preferences {
-  return { brands: [], genders: [], perfumers: [], families: [] };
+  return { brands: [], genders: [], perfumers: [], families: [], liked: [] };
 }
 
 function apiUrl(): string {
@@ -77,6 +100,14 @@ export async function openSession(username: string): Promise<SessionResponse> {
     throw await errorFrom(response);
   }
   return response.json() as Promise<SessionResponse>;
+}
+
+export async function searchPerfumes(query: string): Promise<PerfumeHit[]> {
+  const response = await fetch(`${apiUrl()}/perfumes?q=${encodeURIComponent(query)}`);
+  if (!response.ok) {
+    throw await errorFrom(response);
+  }
+  return response.json() as Promise<PerfumeHit[]>;
 }
 
 export async function fetchOptions(): Promise<OptionsResponse> {

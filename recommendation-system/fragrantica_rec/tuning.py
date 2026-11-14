@@ -436,7 +436,7 @@ def tune_pipeline(
     materials: list[Any],
     config: PipelineConfig,
 ) -> PipelineSelection:
-    """Ajusta fusión y LambdaRank maximizando el NDCG@20 del último fold."""
+    """Ajusta fusión y LambdaRank maximizando el NDCG@10 del último fold."""
 
     try:
         import optuna
@@ -469,7 +469,7 @@ def tune_pipeline(
         )
 
     def objective(trial: Any) -> float:
-        """NDCG@20 del último fold para un corte, unos pesos y un LambdaRank."""
+        """NDCG@10 del último fold para un corte, unos pesos y un LambdaRank."""
 
         cutoff = int(retrieval.search.rrf_cutoff.suggest(trial, "rrf_cutoff"))
         weights = {
@@ -508,7 +508,7 @@ def tune_pipeline(
             overrides=parameters,
         ).fit(train, validation)
         recommendations = ranker.predict(validation)
-        score = ndcg_at_k(recommendations, target, k=20)
+        score = ndcg_at_k(recommendations, target, k=10)
         trial.set_user_attr("weights", dict(fusion.weights))
         trial.set_user_attr("rrf_cutoff", cutoff)
         trial.set_user_attr("ranker", parameters)
